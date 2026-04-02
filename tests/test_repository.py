@@ -46,7 +46,7 @@ def test_repository_subtasks_association_and_cascade_delete(tmp_path):
     created = repository.create(
         TaskData(title="Planear viagem", description="Checklist geral", priority=Priority.MEDIUM)
     )
-    root = repository.create_subtask(created.id, "Reservar hotel")
+    root = repository.create_subtask(created.id, "Reservar hotel", description="Zona centro")
     child = repository.create_subtask(created.id, "Enviar docs", parent_subtask_id=root.id)
     repository.mark_subtask_done(child.id, True)
     repository.create_subtask(created.id, "Comprar bilhetes")
@@ -59,6 +59,7 @@ def test_repository_subtasks_association_and_cascade_delete(tmp_path):
     assert len(subtasks) == 3
     by_title = {subtask.title: subtask for subtask in subtasks}
     assert by_title["Reservar hotel"].parent_subtask_id is None
+    assert by_title["Reservar hotel"].description == "Zona centro"
     assert by_title["Enviar docs"].parent_subtask_id == root.id
     assert by_title["Enviar docs"].status is Status.DONE
 
@@ -134,8 +135,8 @@ def test_repository_filters_and_search(tmp_path):
     repository.replace_subtasks(
         first.id,
         [
-            SubtaskData(title="Passar no supermercado", status=Status.TODO),
-            SubtaskData(title="Pagar caixa", status=Status.TODO),
+            SubtaskData(title="Passar no supermercado", description="Levar cupoes", status=Status.TODO),
+            SubtaskData(title="Pagar caixa", description="Confirmar desconto fidelidade", status=Status.TODO),
         ],
     )
 
@@ -149,8 +150,23 @@ def test_repository_filters_and_search(tmp_path):
     assert len(query_result) == 1
     assert query_result[0].id == first.id
 
+    subtask_description_result = repository.list(filters=TaskFilters(query="fidelidade"))
+    assert len(subtask_description_result) == 1
+    assert subtask_description_result[0].id == first.id
+
     by_due_date = repository.list(sort="due_date_asc")
     assert len(by_due_date) == 3
+
+
+def test_repository_update_subtask_description(tmp_path):
+    repository = TaskRepository(tmp_path / "todo.db")
+    repository.migrate()
+    task = repository.create(TaskData(title="Documentar app", priority=Priority.MEDIUM))
+    subtask = repository.create_subtask(task.id, "Escrever draft", description="Primeira versao")
+
+    repository.update_subtask(subtask.id, description="Versao final revista")
+    loaded = repository.get_subtask(subtask.id)
+    assert loaded.description == "Versao final revista"
 
 
 def test_repository_persistence_across_restarts(tmp_path):

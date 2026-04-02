@@ -47,6 +47,7 @@ class TaskRepository:
                     task_id INTEGER NOT NULL,
                     parent_subtask_id INTEGER NULL,
                     title TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL CHECK(status IN ('todo', 'done')),
                     position INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
@@ -57,7 +58,7 @@ class TaskRepository:
                 """
             )
 
-            _ensure_subtasks_parent_column(conn)
+            _ensure_subtasks_compat_columns(conn)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_subtasks_task_id ON subtasks(task_id)")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_subtasks_parent_id ON subtasks(parent_subtask_id)"
@@ -188,13 +189,14 @@ class TaskRepository:
                     OR EXISTS (
                         SELECT 1
                         FROM subtasks s
-                        WHERE s.task_id = t.id AND LOWER(s.title) LIKE ?
+                        WHERE s.task_id = t.id
+                        AND (LOWER(s.title) LIKE ? OR LOWER(s.description) LIKE ?)
                     )
                 )
                 """
             )
             like_value = f"%{filters.query.lower()}%"
-            params.extend([like_value, like_value, like_value])
+            params.extend([like_value, like_value, like_value, like_value])
 
         where_sql = ""
         if where_parts:
@@ -255,7 +257,16 @@ class TaskRepository:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """
-                SELECT id, task_id, parent_subtask_id, title, status, position, created_at, updated_at
+                SELECT
+                    id,
+                    task_id,
+                    parent_subtask_id,
+                    title,
+                    description,
+                    status,
+                    position,
+                    created_at,
+                    updated_at
                 FROM subtasks
                 WHERE task_id = ?
                 ORDER BY position ASC, id ASC
@@ -273,13 +284,23 @@ class TaskRepository:
                 conn.execute(
                     """
                     INSERT INTO subtasks
-                    (task_id, parent_subtask_id, title, status, position, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (
+                        task_id,
+                        parent_subtask_id,
+                        title,
+                        description,
+                        status,
+                        position,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
                         subtask.parent_subtask_id,
                         subtask.title,
+                        subtask.description,
                         subtask.status.value,
                         idx,
                         now,
@@ -291,7 +312,11 @@ class TaskRepository:
         return self.list_subtasks(task_id)
 
     def create_subtask(
-        self, task_id: int, title: str, parent_subtask_id: int | None = None
+        self,
+        task_id: int,
+        title: str,
+        description: str = "",
+        parent_subtask_id: int | None = None,
     ) -> Subtask:
         with self._connect() as conn:
             _ensure_task_exists(conn, task_id)
@@ -303,10 +328,28 @@ class TaskRepository:
             cursor = conn.execute(
                 """
                 INSERT INTO subtasks
-                (task_id, parent_subtask_id, title, status, position, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (
+                    task_id,
+                    parent_subtask_id,
+                    title,
+                    description,
+                    status,
+                    position,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (task_id, parent_subtask_id, title, Status.TODO.value, position, now, now),
+                (
+                    task_id,
+                    parent_subtask_id,
+                    title,
+                    description,
+                    Status.TODO.value,
+                    position,
+                    now,
+                    now,
+                ),
             )
             subtask_id = int(cursor.lastrowid)
             _touch_task(conn, task_id)
@@ -314,13 +357,23 @@ class TaskRepository:
         return self.get_subtask(subtask_id)
 
     def update_subtask_title(self, subtask_id: int, title: str) -> Subtask:
+        return self.update_subtask(subtask_id=subtask_id, title=title)
+
+    def update_subtask(
+        self,
+        subtask_id: int,
+        title: str | None = None,
+        description: str | None = None,
+    ) -> Subtask:
         with self._connect() as conn:
             subtask = _get_subtask_row(conn, subtask_id)
             if subtask is None:
                 raise ValueError(f"Subtarefa com id {subtask_id} nao existe.")
+            new_title = title if title is not None else str(subtask["title"])
+            new_description = description if description is not None else str(subtask["description"])
             conn.execute(
-                "UPDATE subtasks SET title = ?, updated_at = ? WHERE id = ?",
-                (title, _now_iso(), subtask_id),
+                "UPDATE subtasks SET title = ?, description = ?, updated_at = ? WHERE id = ?",
+                (new_title, new_description, _now_iso(), subtask_id),
             )
             _touch_task(conn, int(subtask["task_id"]))
             conn.commit()
@@ -410,7 +463,16 @@ class TaskRepository:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 """
-                SELECT id, task_id, parent_subtask_id, title, status, position, created_at, updated_at
+                SELECT
+                    id,
+                    task_id,
+                    parent_subtask_id,
+                    title,
+                    description,
+                    status,
+                    position,
+                    created_at,
+                    updated_at
                 FROM subtasks
                 WHERE id = ?
                 """,
@@ -463,6 +525,7 @@ def _row_to_subtask(row: sqlite3.Row) -> Subtask:
         task_id=int(row["task_id"]),
         parent_subtask_id=int(parent_raw) if parent_raw is not None else None,
         title=row["title"],
+        description=row["description"],
         status=Status(row["status"]),
         position=int(row["position"]),
         created_at=datetime.fromisoformat(row["created_at"]),
@@ -474,7 +537,16 @@ def _get_subtask_row(conn: sqlite3.Connection, subtask_id: int) -> sqlite3.Row |
     conn.row_factory = sqlite3.Row
     return conn.execute(
         """
-        SELECT id, task_id, parent_subtask_id, title, status, position, created_at, updated_at
+        SELECT
+            id,
+            task_id,
+            parent_subtask_id,
+            title,
+            description,
+            status,
+            position,
+            created_at,
+            updated_at
         FROM subtasks
         WHERE id = ?
         """,
@@ -529,11 +601,13 @@ def _touch_task(conn: sqlite3.Connection, task_id: int) -> None:
     conn.execute("UPDATE tasks SET updated_at = ? WHERE id = ?", (_now_iso(), task_id))
 
 
-def _ensure_subtasks_parent_column(conn: sqlite3.Connection) -> None:
+def _ensure_subtasks_compat_columns(conn: sqlite3.Connection) -> None:
     rows = conn.execute("PRAGMA table_info(subtasks)").fetchall()
     column_names = {row[1] for row in rows}
     if "parent_subtask_id" not in column_names:
         conn.execute("ALTER TABLE subtasks ADD COLUMN parent_subtask_id INTEGER NULL")
+    if "description" not in column_names:
+        conn.execute("ALTER TABLE subtasks ADD COLUMN description TEXT NOT NULL DEFAULT ''")
 
 
 def _now_iso() -> str:

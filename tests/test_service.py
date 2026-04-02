@@ -74,12 +74,16 @@ def test_service_rejects_invalid_subtask_title(service: TaskService):
 def test_service_supports_nested_subtasks(service: TaskService):
     task = service.create_task(title="Projeto X", priority=Priority.HIGH)
 
-    root = service.create_subtask(task.id, "Backend")
+    root = service.create_subtask(task.id, "Backend", description="Implementacao principal")
     child = service.create_subtask(task.id, "API auth", parent_subtask_id=root.id)
     grandchild = service.create_subtask(task.id, "Testes auth", parent_subtask_id=child.id)
 
     service.mark_subtask_done(child.id, True)
-    service.update_subtask_title(grandchild.id, "Testes de permissao")
+    service.update_subtask(
+        grandchild.id,
+        title="Testes de permissao",
+        description="Cobrir cenarios invalidos",
+    )
 
     loaded = service.get_task(task.id)
     assert loaded.subtask_total == 3
@@ -87,8 +91,10 @@ def test_service_supports_nested_subtasks(service: TaskService):
     assert len(loaded.subtasks) == 3
 
     by_id = {subtask.id: subtask for subtask in loaded.subtasks}
+    assert by_id[root.id].description == "Implementacao principal"
     assert by_id[child.id].parent_subtask_id == root.id
     assert by_id[grandchild.id].parent_subtask_id == child.id
+    assert by_id[grandchild.id].description == "Cobrir cenarios invalidos"
 
     service.delete_subtask(root.id)
     remaining = service.list_subtasks(task.id)
@@ -126,3 +132,9 @@ def test_service_uncheck_nested_subtask_marks_ancestors_todo(service: TaskServic
     assert state[child.id].status is Status.TODO
     assert state[root.id].status is Status.TODO
     assert service.get_task(task.id).status is Status.TODO
+
+
+def test_service_subtask_description_is_trimmed(service: TaskService):
+    task = service.create_task(title="Qualidade", priority=Priority.LOW)
+    created = service.create_subtask(task.id, "Review", description="   notas   ")
+    assert created.description == "notas"

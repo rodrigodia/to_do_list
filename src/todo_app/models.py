@@ -56,6 +56,7 @@ class Task:
 @dataclass(slots=True)
 class SubtaskData:
     title: str
+    description: str = ""
     status: Status = Status.TODO
     position: int = 0
     parent_subtask_id: int | None = None
@@ -66,6 +67,7 @@ class Subtask:
     id: int
     task_id: int
     title: str
+    description: str
     status: Status
     position: int
     parent_subtask_id: int | None

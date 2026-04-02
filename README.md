@@ -27,6 +27,7 @@ pip install -e .[dev]
 - Criar, editar e apagar tarefas
 - Marcar/desmarcar tarefa como concluida
 - Criar e gerir subtarefas com multiplos niveis (subtarefas de subtarefas)
+- Definir titulo e descricao para cada subtarefa
 - Mostrar subtarefas na lista principal com indentacao hierarquica
 - Filtrar por estado e prioridade
 - Pesquisar por texto no titulo/descricao

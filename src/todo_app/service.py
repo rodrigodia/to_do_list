@@ -83,18 +83,40 @@ class TaskService:
         return self.repository.get_subtask(subtask_id)
 
     def create_subtask(
-        self, task_id: int, title: str, parent_subtask_id: int | None = None
+        self,
+        task_id: int,
+        title: str,
+        description: str = "",
+        parent_subtask_id: int | None = None,
     ) -> Subtask:
         normalized_title = self._normalize_subtask_title(title)
+        normalized_description = self._normalize_subtask_description(description)
         return self.repository.create_subtask(
             task_id=task_id,
             title=normalized_title,
+            description=normalized_description,
             parent_subtask_id=parent_subtask_id,
         )
 
     def update_subtask_title(self, subtask_id: int, title: str) -> Subtask:
         normalized_title = self._normalize_subtask_title(title)
         return self.repository.update_subtask_title(subtask_id=subtask_id, title=normalized_title)
+
+    def update_subtask(
+        self,
+        subtask_id: int,
+        title: str | None = None,
+        description: str | None = None,
+    ) -> Subtask:
+        normalized_title = self._normalize_subtask_title(title) if title is not None else None
+        normalized_description = (
+            self._normalize_subtask_description(description) if description is not None else None
+        )
+        return self.repository.update_subtask(
+            subtask_id=subtask_id,
+            title=normalized_title,
+            description=normalized_description,
+        )
 
     def delete_subtask(self, subtask_id: int) -> None:
         self.repository.delete_subtask(subtask_id)
@@ -157,6 +179,7 @@ class TaskService:
             normalized.append(
                 SubtaskData(
                     title=title,
+                    description=self._normalize_subtask_description(subtask.description),
                     status=status,
                     position=idx,
                     parent_subtask_id=subtask.parent_subtask_id,
@@ -169,3 +192,6 @@ class TaskService:
         if not normalized:
             raise ValidationError("As subtarefas precisam de titulo.")
         return normalized
+
+    def _normalize_subtask_description(self, description: str) -> str:
+        return description.strip()

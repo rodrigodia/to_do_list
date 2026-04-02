@@ -3,12 +3,12 @@ from __future__ import annotations
 from datetime import datetime
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
     QHBoxLayout,
     QHeaderView,
-    QInputDialog,
     QLineEdit,
     QMainWindow,
     QMessageBox,
@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 
 from todo_app.models import PRIORITY_LABELS_PT, Priority, Status, Subtask, Task, priority_label_pt
 from todo_app.service import TaskService, ValidationError
+from todo_app.ui.subtask_dialog import SubtaskDialog
 from todo_app.ui.task_dialog import TaskDialog
 
 ROLE_ENTITY_TYPE = Qt.UserRole
@@ -56,9 +57,9 @@ class MainWindow(QMainWindow):
 
         filters_bar = QHBoxLayout()
         self.status_filter = QComboBox()
-        self.status_filter.addItem("Todos os estados", None)
         self.status_filter.addItem("Por fazer", Status.TODO)
         self.status_filter.addItem("Concluidas", Status.DONE)
+        self.status_filter.addItem("Todos os estados", None)
 
         self.priority_filter = QComboBox()
         self.priority_filter.addItem("Todas as prioridades", None)
@@ -69,9 +70,9 @@ class MainWindow(QMainWindow):
         self.search_input.setPlaceholderText("Pesquisar por titulo ou descricao...")
 
         self.sort_filter = QComboBox()
-        self.sort_filter.addItem("Mais recentes", "created_desc")
-        self.sort_filter.addItem("Data limite", "due_date_asc")
         self.sort_filter.addItem("Prioridade", "priority_desc")
+        self.sort_filter.addItem("Data limite", "due_date_asc")
+        self.sort_filter.addItem("Mais recentes", "created_desc")
 
         filters_bar.addWidget(self.status_filter)
         filters_bar.addWidget(self.priority_filter)
@@ -84,8 +85,11 @@ class MainWindow(QMainWindow):
             ["Feita", "Titulo", "Prioridade", "Data limite", "Subtarefas", "Atualizada"]
         )
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setWordWrap(True)
+        self.table.setTextElideMode(Qt.ElideNone)
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -108,6 +112,10 @@ class MainWindow(QMainWindow):
         self.sort_filter.currentIndexChanged.connect(self.refresh_tasks)
         self.table.itemChanged.connect(self._on_item_changed)
         self.table.itemDoubleClicked.connect(lambda _: self._edit_selected_item())
+        self.delete_shortcut = QShortcut(QKeySequence(Qt.Key_Delete), self.table)
+        self.delete_shortcut.activated.connect(self._delete_selected_item)
+        self.new_subtask_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
+        self.new_subtask_shortcut.activated.connect(self._create_subtask)
 
         self.refresh_tasks()
 
@@ -191,6 +199,8 @@ class MainWindow(QMainWindow):
         indent = "    " * depth
         title_text = f"{indent}- {subtask.title}"
         title_item = QTableWidgetItem(title_text)
+        if subtask.description:
+            title_item.setToolTip(subtask.description)
         self._set_item_identity(title_item, "subtask", subtask.id, task_id)
         self.table.setItem(row, 1, title_item)
 
@@ -284,14 +294,18 @@ class MainWindow(QMainWindow):
         else:
             parent_subtask_id = selected["entity_id"]
 
-        title, ok = QInputDialog.getText(self, "Nova subtarefa", "Titulo")
-        if not ok:
+        dialog = SubtaskDialog(self, is_edit=False)
+        if dialog.exec() != SubtaskDialog.Accepted:
+            return
+        title, description = dialog.get_values()
+        if not title:
             return
 
         try:
             self.service.create_subtask(
                 task_id=task_id,
                 title=title,
+                description=description,
                 parent_subtask_id=parent_subtask_id,
             )
             self.refresh_tasks()
@@ -330,23 +344,51 @@ class MainWindow(QMainWindow):
 
     def _edit_selected_subtask(self, subtask_id: int) -> None:
         subtask = self.service.get_subtask(subtask_id)
-        title, ok = QInputDialog.getText(self, "Editar subtarefa", "Titulo", text=subtask.title)
-        if not ok:
+        dialog = SubtaskDialog(
+            self,
+            title=subtask.title,
+            description=subtask.description,
+            is_edit=True,
+        )
+        if dialog.exec() != SubtaskDialog.Accepted:
             return
+        title, description = dialog.get_values()
         try:
-            self.service.update_subtask_title(subtask_id=subtask_id, title=title)
+            self.service.update_subtask(
+                subtask_id=subtask_id,
+                title=title,
+                description=description,
+            )
             self.refresh_tasks()
         except (ValidationError, ValueError) as exc:
             QMessageBox.warning(self, "Erro", str(exc))
 
     def _delete_selected_item(self) -> None:
-        selected = self._selected_entity()
-        if selected is None:
-            QMessageBox.information(self, "Apagar", "Seleciona uma tarefa ou subtarefa para apagar.")
+        selected_entities = self._selected_entities()
+        if not selected_entities:
+            QMessageBox.information(
+                self,
+                "Apagar",
+                "Seleciona uma ou mais tarefas/subtarefas para apagar.",
+            )
             return
 
-        if selected["entity_type"] == "task":
+        task_count = sum(1 for item in selected_entities if item["entity_type"] == "task")
+        subtask_count = len(selected_entities) - task_count
+        if task_count and subtask_count:
+            message = (
+                f"Tens a certeza que queres apagar {task_count} tarefa(s) e "
+                f"{subtask_count} subtarefa(s)?"
+            )
+        elif task_count > 1:
+            message = f"Tens a certeza que queres apagar as {task_count} tarefas selecionadas?"
+        elif task_count == 1 and subtask_count == 0:
             message = "Tens a certeza que queres apagar a tarefa selecionada?"
+        elif subtask_count > 1:
+            message = (
+                f"Tens a certeza que queres apagar as {subtask_count} subtarefas selecionadas? "
+                "Subtarefas-filhas tambem serao apagadas."
+            )
         else:
             message = (
                 "Tens a certeza que queres apagar a subtarefa selecionada? "
@@ -362,14 +404,22 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.Yes:
             return
 
-        try:
-            if selected["entity_type"] == "task":
-                self.service.delete_task(selected["entity_id"])
-            else:
-                self.service.delete_subtask(selected["entity_id"])
-            self.refresh_tasks()
-        except ValueError as exc:
-            QMessageBox.warning(self, "Erro", str(exc))
+        entities_to_delete = self._normalize_delete_selection(selected_entities)
+        errors: list[str] = []
+        for item in entities_to_delete:
+            try:
+                if item["entity_type"] == "task":
+                    self.service.delete_task(item["entity_id"])
+                else:
+                    self.service.delete_subtask(item["entity_id"])
+            except ValueError as exc:
+                # Ignore "already deleted" from cascade effects.
+                if "nao existe" not in str(exc):
+                    errors.append(str(exc))
+
+        self.refresh_tasks()
+        if errors:
+            QMessageBox.warning(self, "Erro", errors[0])
 
     def _selected_entity(self) -> dict[str, int | str] | None:
         row = self.table.currentRow()
@@ -390,6 +440,60 @@ class MainWindow(QMainWindow):
             "entity_id": int(entity_id),
             "task_id": int(task_id),
         }
+
+    def _selected_entities(self) -> list[dict[str, int | str]]:
+        rows = sorted({index.row() for index in self.table.selectionModel().selectedRows()})
+        entities: list[dict[str, int | str]] = []
+        seen: set[tuple[str, int]] = set()
+
+        if not rows and self.table.currentRow() >= 0:
+            rows = [self.table.currentRow()]
+
+        for row in rows:
+            title_item = self.table.item(row, 1)
+            if title_item is None:
+                continue
+            entity_type = title_item.data(ROLE_ENTITY_TYPE)
+            entity_id = title_item.data(ROLE_ENTITY_ID)
+            task_id = title_item.data(ROLE_TASK_ID)
+            if entity_type not in {"task", "subtask"}:
+                continue
+            if entity_id is None or task_id is None:
+                continue
+            key = (str(entity_type), int(entity_id))
+            if key in seen:
+                continue
+            seen.add(key)
+            entities.append(
+                {
+                    "entity_type": str(entity_type),
+                    "entity_id": int(entity_id),
+                    "task_id": int(task_id),
+                }
+            )
+
+        return entities
+
+    def _normalize_delete_selection(
+        self, entities: list[dict[str, int | str]]
+    ) -> list[dict[str, int | str]]:
+        selected_task_ids = {
+            int(entity["entity_id"])
+            for entity in entities
+            if entity["entity_type"] == "task"
+        }
+
+        filtered = [
+            entity
+            for entity in entities
+            if not (
+                entity["entity_type"] == "subtask"
+                and int(entity["task_id"]) in selected_task_ids
+            )
+        ]
+
+        filtered.sort(key=lambda entity: 0 if entity["entity_type"] == "task" else 1)
+        return filtered
 
 
 def _format_datetime(value: datetime) -> str:
