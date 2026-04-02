@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLineEdit,
     QMainWindow,
     QMessageBox,
@@ -18,9 +19,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from todo_app.models import PRIORITY_LABELS_PT, Priority, Status, Task, priority_label_pt
+from todo_app.models import PRIORITY_LABELS_PT, Priority, Status, Subtask, Task, priority_label_pt
 from todo_app.service import TaskService, ValidationError
 from todo_app.ui.task_dialog import TaskDialog
+
+ROLE_ENTITY_TYPE = Qt.UserRole
+ROLE_ENTITY_ID = Qt.UserRole + 1
+ROLE_TASK_ID = Qt.UserRole + 2
 
 
 class MainWindow(QMainWindow):
@@ -30,7 +35,7 @@ class MainWindow(QMainWindow):
         self._loading_table = False
 
         self.setWindowTitle("To-Do List")
-        self.resize(920, 560)
+        self.resize(980, 620)
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -39,9 +44,11 @@ class MainWindow(QMainWindow):
 
         actions_bar = QHBoxLayout()
         self.new_button = QPushButton("Nova tarefa")
+        self.new_subtask_button = QPushButton("Nova subtarefa")
         self.edit_button = QPushButton("Editar")
         self.delete_button = QPushButton("Apagar")
         actions_bar.addWidget(self.new_button)
+        actions_bar.addWidget(self.new_subtask_button)
         actions_bar.addWidget(self.edit_button)
         actions_bar.addWidget(self.delete_button)
         actions_bar.addStretch()
@@ -72,8 +79,10 @@ class MainWindow(QMainWindow):
         filters_bar.addWidget(self.sort_filter)
         layout.addLayout(filters_bar)
 
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Feita", "Titulo", "Prioridade", "Data limite", "Atualizada"])
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            ["Feita", "Titulo", "Prioridade", "Data limite", "Subtarefas", "Atualizada"]
+        )
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -84,19 +93,21 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
         layout.addWidget(self.table)
 
         self.statusBar().showMessage("Pronto")
 
         self.new_button.clicked.connect(self._create_task)
-        self.edit_button.clicked.connect(self._edit_selected_task)
-        self.delete_button.clicked.connect(self._delete_selected_task)
+        self.new_subtask_button.clicked.connect(self._create_subtask)
+        self.edit_button.clicked.connect(self._edit_selected_item)
+        self.delete_button.clicked.connect(self._delete_selected_item)
         self.status_filter.currentIndexChanged.connect(self.refresh_tasks)
         self.priority_filter.currentIndexChanged.connect(self.refresh_tasks)
         self.search_input.textChanged.connect(self.refresh_tasks)
         self.sort_filter.currentIndexChanged.connect(self.refresh_tasks)
         self.table.itemChanged.connect(self._on_item_changed)
-        self.table.itemDoubleClicked.connect(lambda _: self._edit_selected_task())
+        self.table.itemDoubleClicked.connect(lambda _: self._edit_selected_item())
 
         self.refresh_tasks()
 
@@ -113,6 +124,8 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(0)
         for task in tasks:
             self._append_task_row(task)
+            subtasks = self.service.list_subtasks(task.id)
+            self._append_nested_subtasks(task.id, subtasks)
         self.table.blockSignals(False)
         self._loading_table = False
 
@@ -122,32 +135,96 @@ class MainWindow(QMainWindow):
         row = self.table.rowCount()
         self.table.insertRow(row)
 
-        checkbox_item = QTableWidgetItem("")
-        checkbox_item.setData(Qt.UserRole, task.id)
-        checkbox_item.setFlags(
-            Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable
+        checkbox_item = self._build_check_item(
+            done=task.status is Status.DONE,
+            entity_type="task",
+            entity_id=task.id,
+            task_id=task.id,
         )
-        checkbox_item.setCheckState(Qt.Checked if task.status is Status.DONE else Qt.Unchecked)
         self.table.setItem(row, 0, checkbox_item)
 
         title_item = QTableWidgetItem(task.title)
-        title_item.setData(Qt.UserRole, task.id)
+        self._set_item_identity(title_item, "task", task.id, task.id)
         self.table.setItem(row, 1, title_item)
 
-        priority_item = QTableWidgetItem(priority_label_pt(task.priority))
-        self.table.setItem(row, 2, priority_item)
-
+        self.table.setItem(row, 2, QTableWidgetItem(priority_label_pt(task.priority)))
         due_date_text = task.due_date.isoformat() if task.due_date else "Sem data"
         self.table.setItem(row, 3, QTableWidgetItem(due_date_text))
 
-        updated_text = _format_datetime(task.updated_at)
-        self.table.setItem(row, 4, QTableWidgetItem(updated_text))
+        progress_text = (
+            "Sem subtarefas"
+            if task.subtask_total == 0
+            else f"{task.subtask_done}/{task.subtask_total} concluidas"
+        )
+        self.table.setItem(row, 4, QTableWidgetItem(progress_text))
+        self.table.setItem(row, 5, QTableWidgetItem(_format_datetime(task.updated_at)))
 
         if task.status is Status.DONE:
             self._strike_row_text(row)
 
+    def _append_nested_subtasks(self, task_id: int, subtasks: list[Subtask]) -> None:
+        children_by_parent: dict[int | None, list[Subtask]] = {}
+        for subtask in subtasks:
+            children_by_parent.setdefault(subtask.parent_subtask_id, []).append(subtask)
+
+        for root_subtask in children_by_parent.get(None, []):
+            self._append_subtask_recursive(task_id, root_subtask, children_by_parent, depth=1)
+
+    def _append_subtask_recursive(
+        self,
+        task_id: int,
+        subtask: Subtask,
+        children_by_parent: dict[int | None, list[Subtask]],
+        depth: int,
+    ) -> None:
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+
+        checkbox_item = self._build_check_item(
+            done=subtask.status is Status.DONE,
+            entity_type="subtask",
+            entity_id=subtask.id,
+            task_id=task_id,
+        )
+        self.table.setItem(row, 0, checkbox_item)
+
+        indent = "    " * depth
+        title_text = f"{indent}- {subtask.title}"
+        title_item = QTableWidgetItem(title_text)
+        self._set_item_identity(title_item, "subtask", subtask.id, task_id)
+        self.table.setItem(row, 1, title_item)
+
+        self.table.setItem(row, 2, QTableWidgetItem(""))
+        self.table.setItem(row, 3, QTableWidgetItem(""))
+        child_count = len(children_by_parent.get(subtask.id, []))
+        child_text = "" if child_count == 0 else f"{child_count} sub"
+        self.table.setItem(row, 4, QTableWidgetItem(child_text))
+        self.table.setItem(row, 5, QTableWidgetItem(_format_datetime(subtask.updated_at)))
+
+        if subtask.status is Status.DONE:
+            self._strike_row_text(row)
+
+        for child in children_by_parent.get(subtask.id, []):
+            self._append_subtask_recursive(task_id, child, children_by_parent, depth=depth + 1)
+
+    def _build_check_item(
+        self, done: bool, entity_type: str, entity_id: int, task_id: int
+    ) -> QTableWidgetItem:
+        checkbox_item = QTableWidgetItem("")
+        checkbox_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
+        checkbox_item.setCheckState(Qt.Checked if done else Qt.Unchecked)
+        self._set_item_identity(checkbox_item, entity_type, entity_id, task_id)
+        return checkbox_item
+
+    def _set_item_identity(
+        self, item: QTableWidgetItem, entity_type: str, entity_id: int, task_id: int
+    ) -> None:
+        item.setData(ROLE_ENTITY_TYPE, entity_type)
+        item.setData(ROLE_ENTITY_ID, entity_id)
+        item.setData(ROLE_TASK_ID, task_id)
+
     def _strike_row_text(self, row: int) -> None:
-        for column in (1, 2, 3, 4):
+        for column in (1, 2, 3, 4, 5):
             item = self.table.item(row, column)
             if item is None:
                 continue
@@ -159,10 +236,15 @@ class MainWindow(QMainWindow):
         if self._loading_table or item.column() != 0:
             return
 
-        task_id = item.data(Qt.UserRole)
+        entity_type = item.data(ROLE_ENTITY_TYPE)
+        entity_id = item.data(ROLE_ENTITY_ID)
         done = item.checkState() == Qt.Checked
+
         try:
-            self.service.mark_done(int(task_id), done)
+            if entity_type == "task":
+                self.service.mark_done(int(entity_id), done)
+            elif entity_type == "subtask":
+                self.service.mark_subtask_done(int(entity_id), done)
             self.refresh_tasks()
         except ValueError as exc:
             QMessageBox.warning(self, "Erro", str(exc))
@@ -185,12 +267,49 @@ class MainWindow(QMainWindow):
         except ValidationError as exc:
             QMessageBox.warning(self, "Validacao", str(exc))
 
-    def _edit_selected_task(self) -> None:
-        task_id = self._selected_task_id()
-        if task_id is None:
-            QMessageBox.information(self, "Editar tarefa", "Seleciona uma tarefa para editar.")
+    def _create_subtask(self) -> None:
+        selected = self._selected_entity()
+        if selected is None:
+            QMessageBox.information(
+                self,
+                "Nova subtarefa",
+                "Seleciona primeiro uma tarefa ou subtarefa para definir onde criar.",
+            )
             return
 
+        parent_subtask_id: int | None
+        task_id = selected["task_id"]
+        if selected["entity_type"] == "task":
+            parent_subtask_id = None
+        else:
+            parent_subtask_id = selected["entity_id"]
+
+        title, ok = QInputDialog.getText(self, "Nova subtarefa", "Titulo")
+        if not ok:
+            return
+
+        try:
+            self.service.create_subtask(
+                task_id=task_id,
+                title=title,
+                parent_subtask_id=parent_subtask_id,
+            )
+            self.refresh_tasks()
+        except (ValidationError, ValueError) as exc:
+            QMessageBox.warning(self, "Erro", str(exc))
+
+    def _edit_selected_item(self) -> None:
+        selected = self._selected_entity()
+        if selected is None:
+            QMessageBox.information(self, "Editar", "Seleciona uma tarefa ou subtarefa para editar.")
+            return
+
+        if selected["entity_type"] == "task":
+            self._edit_selected_task(selected["entity_id"])
+        else:
+            self._edit_selected_subtask(selected["entity_id"])
+
+    def _edit_selected_task(self, task_id: int) -> None:
         task = self.service.get_task(task_id)
         dialog = TaskDialog(self, task=task)
         if dialog.exec() != TaskDialog.Accepted:
@@ -209,38 +328,68 @@ class MainWindow(QMainWindow):
         except (ValidationError, ValueError) as exc:
             QMessageBox.warning(self, "Erro", str(exc))
 
-    def _delete_selected_task(self) -> None:
-        task_id = self._selected_task_id()
-        if task_id is None:
-            QMessageBox.information(self, "Apagar tarefa", "Seleciona uma tarefa para apagar.")
+    def _edit_selected_subtask(self, subtask_id: int) -> None:
+        subtask = self.service.get_subtask(subtask_id)
+        title, ok = QInputDialog.getText(self, "Editar subtarefa", "Titulo", text=subtask.title)
+        if not ok:
             return
+        try:
+            self.service.update_subtask_title(subtask_id=subtask_id, title=title)
+            self.refresh_tasks()
+        except (ValidationError, ValueError) as exc:
+            QMessageBox.warning(self, "Erro", str(exc))
+
+    def _delete_selected_item(self) -> None:
+        selected = self._selected_entity()
+        if selected is None:
+            QMessageBox.information(self, "Apagar", "Seleciona uma tarefa ou subtarefa para apagar.")
+            return
+
+        if selected["entity_type"] == "task":
+            message = "Tens a certeza que queres apagar a tarefa selecionada?"
+        else:
+            message = (
+                "Tens a certeza que queres apagar a subtarefa selecionada? "
+                "As subtarefas-filhas tambem serao apagadas."
+            )
 
         answer = QMessageBox.question(
             self,
             "Confirmar apagamento",
-            "Tens a certeza que queres apagar a tarefa selecionada?",
+            message,
             QMessageBox.Yes | QMessageBox.No,
         )
         if answer != QMessageBox.Yes:
             return
 
         try:
-            self.service.delete_task(task_id)
+            if selected["entity_type"] == "task":
+                self.service.delete_task(selected["entity_id"])
+            else:
+                self.service.delete_subtask(selected["entity_id"])
             self.refresh_tasks()
         except ValueError as exc:
             QMessageBox.warning(self, "Erro", str(exc))
 
-    def _selected_task_id(self) -> int | None:
+    def _selected_entity(self) -> dict[str, int | str] | None:
         row = self.table.currentRow()
         if row < 0:
             return None
         title_item = self.table.item(row, 1)
         if title_item is None:
             return None
-        task_id = title_item.data(Qt.UserRole)
-        if task_id is None:
+        entity_type = title_item.data(ROLE_ENTITY_TYPE)
+        entity_id = title_item.data(ROLE_ENTITY_ID)
+        task_id = title_item.data(ROLE_TASK_ID)
+        if entity_type not in {"task", "subtask"}:
             return None
-        return int(task_id)
+        if entity_id is None or task_id is None:
+            return None
+        return {
+            "entity_type": str(entity_type),
+            "entity_id": int(entity_id),
+            "task_id": int(task_id),
+        }
 
 
 def _format_datetime(value: datetime) -> str:

@@ -2,7 +2,17 @@ from __future__ import annotations
 
 from datetime import date
 
-from todo_app.models import Priority, SortOption, Status, Task, TaskData, TaskFilters
+from todo_app.models import (
+    Priority,
+    SortOption,
+    Status,
+    Subtask,
+    SubtaskData,
+    Task,
+    TaskData,
+    TaskFilters,
+    TaskWithSubtasks,
+)
 from todo_app.repository import TaskRepository
 
 
@@ -20,17 +30,23 @@ class TaskService:
         description: str = "",
         priority: Priority | str = Priority.MEDIUM,
         due_date: date | None = None,
+        subtasks: list[SubtaskData] | None = None,
     ) -> Task:
+        normalized_subtasks = self._normalize_subtasks(subtasks) if subtasks is not None else None
         normalized = TaskData(
             title=self._normalize_title(title),
             description=description.strip(),
             priority=self._normalize_priority(priority),
             due_date=self._normalize_due_date(due_date),
         )
-        return self.repository.create(normalized)
+        created = self.repository.create(normalized)
+        if normalized_subtasks is not None:
+            self.repository.replace_subtasks(created.id, normalized_subtasks)
+            return self.repository.get(created.id)
+        return created
 
-    def get_task(self, task_id: int) -> Task:
-        return self.repository.get(task_id)
+    def get_task(self, task_id: int) -> TaskWithSubtasks:
+        return self.repository.get_with_subtasks(task_id)
 
     def update_task(
         self,
@@ -39,20 +55,52 @@ class TaskService:
         description: str = "",
         priority: Priority | str = Priority.MEDIUM,
         due_date: date | None = None,
+        subtasks: list[SubtaskData] | None = None,
     ) -> Task:
+        normalized_subtasks = self._normalize_subtasks(subtasks) if subtasks is not None else None
         normalized = TaskData(
             title=self._normalize_title(title),
             description=description.strip(),
             priority=self._normalize_priority(priority),
             due_date=self._normalize_due_date(due_date),
         )
-        return self.repository.update(task_id, normalized)
+        updated = self.repository.update(task_id, normalized)
+        if normalized_subtasks is not None:
+            self.repository.replace_subtasks(task_id, normalized_subtasks)
+            return self.repository.get(task_id)
+        return updated
 
     def delete_task(self, task_id: int) -> None:
         self.repository.delete(task_id)
 
     def mark_done(self, task_id: int, done: bool) -> Task:
         return self.repository.mark_done(task_id, done)
+
+    def list_subtasks(self, task_id: int) -> list[Subtask]:
+        return self.repository.list_subtasks(task_id)
+
+    def get_subtask(self, subtask_id: int) -> Subtask:
+        return self.repository.get_subtask(subtask_id)
+
+    def create_subtask(
+        self, task_id: int, title: str, parent_subtask_id: int | None = None
+    ) -> Subtask:
+        normalized_title = self._normalize_subtask_title(title)
+        return self.repository.create_subtask(
+            task_id=task_id,
+            title=normalized_title,
+            parent_subtask_id=parent_subtask_id,
+        )
+
+    def update_subtask_title(self, subtask_id: int, title: str) -> Subtask:
+        normalized_title = self._normalize_subtask_title(title)
+        return self.repository.update_subtask_title(subtask_id=subtask_id, title=normalized_title)
+
+    def delete_subtask(self, subtask_id: int) -> None:
+        self.repository.delete_subtask(subtask_id)
+
+    def mark_subtask_done(self, subtask_id: int, done: bool) -> Subtask:
+        return self.repository.mark_subtask_done(subtask_id, done)
 
     def list_tasks(
         self,
@@ -96,3 +144,28 @@ class TaskService:
         if not isinstance(due_date, date):
             raise ValidationError("Data limite invalida.")
         return due_date
+
+    def _normalize_subtasks(self, subtasks: list[SubtaskData]) -> list[SubtaskData]:
+        normalized: list[SubtaskData] = []
+        for idx, subtask in enumerate(subtasks):
+            if not isinstance(subtask, SubtaskData):
+                raise ValidationError("Subtarefas invalidas.")
+            title = self._normalize_subtask_title(subtask.title)
+            status = self._normalize_status(subtask.status)
+            if status is None:
+                raise ValidationError("Estado invalido para subtarefa.")
+            normalized.append(
+                SubtaskData(
+                    title=title,
+                    status=status,
+                    position=idx,
+                    parent_subtask_id=subtask.parent_subtask_id,
+                )
+            )
+        return normalized
+
+    def _normalize_subtask_title(self, title: str) -> str:
+        normalized = title.strip()
+        if not normalized:
+            raise ValidationError("As subtarefas precisam de titulo.")
+        return normalized

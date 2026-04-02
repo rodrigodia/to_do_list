@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import StrEnum
 from typing import Literal
@@ -49,6 +49,33 @@ class Task:
     status: Status
     created_at: datetime
     updated_at: datetime
+    subtask_total: int = 0
+    subtask_done: int = 0
+
+
+@dataclass(slots=True)
+class SubtaskData:
+    title: str
+    status: Status = Status.TODO
+    position: int = 0
+    parent_subtask_id: int | None = None
+
+
+@dataclass(slots=True)
+class Subtask:
+    id: int
+    task_id: int
+    title: str
+    status: Status
+    position: int
+    parent_subtask_id: int | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(slots=True)
+class TaskWithSubtasks(Task):
+    subtasks: list[Subtask] = field(default_factory=list)
 
 
 @dataclass(slots=True)
