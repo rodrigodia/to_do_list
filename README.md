@@ -20,7 +20,7 @@ pip install -e .[dev]
 - Test: `pytest`
 - Lint: `ruff check .`
 - Format: `black .`
-- Build EXE (Windows): `pyinstaller --name TodoList --windowed --onefile src/todo_app/__main__.py`
+- Build EXE (Windows): `pyinstaller --name TodoList --windowed --onefile --add-data "assets/images/icon_todo_list.jpg;assets/images" src/todo_app/__main__.py`
 
 ## Funcionalidades v1
 
