@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+
+{% block title %}
+  {% if mode == "new" %}Nova subtarefa{% else %}Editar subtarefa{% endif %}
+{% endblock %}
+
+{% block content %}
+<section class="panel edit-panel">
+  {% if mode == "new" %}
+  <h1>Nova subtarefa</h1>
+  {% else %}
+  <h1>Editar subtarefa</h1>
+  {% endif %}
+
+  <p class="muted">Tarefa principal: <strong>{{ task.title }}</strong></p>
+  {% if parent_subtask %}
+  <p class="muted">Subtarefa pai: <strong>{{ parent_subtask.title }}</strong></p>
+  {% endif %}
+
+  {% if mode == "new" %}
+  <form method="post" action="/subtasks/create" class="grid-form edit-form">
+    <input type="hidden" name="task_id" value="{{ task_id }}" />
+    <input type="hidden" name="next_url" value="{{ next_url }}" />
+    {% if parent_subtask_id %}
+    <input type="hidden" name="parent_subtask_id" value="{{ parent_subtask_id }}" />
+    {% endif %}
+  {% else %}
+  <form method="post" action="/subtasks/{{ subtask.id }}/update" class="grid-form edit-form">
+    <input type="hidden" name="next_url" value="{{ next_url }}" />
+  {% endif %}
+
+    <label>
+      Titulo
+      <input type="text" name="title" value="{% if subtask %}{{ subtask.title }}{% endif %}" required />
+    </label>
+
+    <label class="description-field">
+      Descricao
+      <textarea name="description" rows="8">{% if subtask %}{{ subtask.description }}{% endif %}</textarea>
+    </label>
+
+    <div class="actions-inline">
+      {% if mode == "new" %}
+      <button type="submit">Criar subtarefa</button>
+      {% else %}
+      <button type="submit">Guardar</button>
+      {% endif %}
+      <a class="button secondary" href="{{ next_url }}">Cancelar</a>
+    </div>
+  </form>
+</section>
+{% endblock %}

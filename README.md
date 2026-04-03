@@ -1,6 +1,10 @@
-# To-Do List Desktop (Python + PySide6)
+# To-Do List (Desktop + Web)
 
-Aplicacao desktop local para gerir tarefas com interface grafica, persistencia em SQLite e foco em simplicidade.
+Aplicacao local para gerir tarefas com persistencia SQLite.
+
+Inclui duas interfaces:
+- Desktop: PySide6
+- Web: FastAPI + templates server-side
 
 ## Requisitos
 
@@ -16,7 +20,9 @@ pip install -e .[dev]
 
 ## Comandos
 
-- Run: `python -m todo_app`
+- Run Desktop: `python -m todo_app`
+- Run Web (script): `todo-web`
+- Run Web (uvicorn): `uvicorn todo_app.web.app:app --reload`
 - Test: `pytest`
 - Lint: `ruff check .`
 - Format: `black .`
@@ -32,10 +38,13 @@ pip install -e .[dev]
 - Filtrar por estado e prioridade
 - Pesquisar por texto no titulo/descricao
 - Ordenar por mais recentes, data limite e prioridade
+- Apagar em lote por selecao multipla
+- Atalhos na versao web: `Delete` (apagar selecao) e `Ctrl+S` (nova subtarefa da selecao)
 
 ## Estrutura
 
 - `src/todo_app/ui`: Interface grafica
+- `src/todo_app/web`: Interface web, templates e static files
 - `src/todo_app/service.py`: Regras de negocio e validacao
 - `src/todo_app/repository.py`: Acesso SQLite e queries
 - `src/todo_app/models.py`: Tipos e entidades

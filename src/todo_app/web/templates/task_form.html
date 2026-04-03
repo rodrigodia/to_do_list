@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+
+{% block title %}Editar tarefa{% endblock %}
+
+{% block content %}
+<section class="panel edit-panel">
+  <h1>Editar tarefa</h1>
+  <form method="post" action="/tasks/{{ task.id }}/update" class="grid-form edit-form">
+    <input type="hidden" name="next_url" value="{{ next_url }}" />
+
+    <label>
+      Titulo
+      <input type="text" name="title" value="{{ task.title }}" required />
+    </label>
+
+    <label class="description-field">
+      Descricao
+      <textarea name="description" rows="8">{{ task.description }}</textarea>
+    </label>
+
+    <label>
+      Prioridade
+      <select name="priority">
+        {% for value in priority_values %}
+        <option value="{{ value.value }}" {% if task.priority.value == value.value %}selected{% endif %}>
+          {{ value.value }}
+        </option>
+        {% endfor %}
+      </select>
+    </label>
+
+    <label>
+      Data limite
+      <input
+        type="date"
+        name="due_date"
+        value="{% if task.due_date %}{{ task.due_date.isoformat() }}{% endif %}"
+      />
+    </label>
+
+    <div class="actions-inline">
+      <button type="submit">Guardar</button>
+      <a class="button secondary" href="{{ next_url }}">Cancelar</a>
+    </div>
+  </form>
+</section>
+{% endblock %}
