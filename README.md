@@ -21,8 +21,8 @@ pip install -e .[dev]
 ## Comandos
 
 - Run Desktop: `python -m todo_app`
-- Run Web (script): `todo-web`
-- Run Web (uvicorn): `uvicorn todo_app.web.app:app --reload`
+- Run Web: `python -m uvicorn todo_app.web.app:app --host 127.0.0.1 --port 8000 --reload`
+- Run Web (script, opcional): `todo-web`
 - Test: `pytest`
 - Lint: `ruff check .`
 - Format: `black .`
