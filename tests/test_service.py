@@ -138,3 +138,26 @@ def test_service_subtask_description_is_trimmed(service: TaskService):
     task = service.create_task(title="Qualidade", priority=Priority.LOW)
     created = service.create_subtask(task.id, "Review", description="   notas   ")
     assert created.description == "notas"
+
+
+def test_service_reorder_subtasks(service: TaskService):
+    task = service.create_task(title="Ordem visual", priority=Priority.MEDIUM)
+    first = service.create_subtask(task.id, "Primeira")
+    second = service.create_subtask(task.id, "Segunda")
+    third = service.create_subtask(task.id, "Terceira")
+
+    service.reorder_subtasks(
+        task_id=task.id,
+        parent_subtask_id=None,
+        ordered_subtask_ids=[third.id, first.id, second.id],
+    )
+    ordered = [sub.id for sub in service.list_subtasks(task.id) if sub.parent_subtask_id is None]
+    assert ordered == [third.id, first.id, second.id]
+
+
+def test_service_reorder_subtasks_requires_ids(service: TaskService):
+    task = service.create_task(title="Validacao", priority=Priority.LOW)
+    service.create_subtask(task.id, "A")
+
+    with pytest.raises(ValidationError):
+        service.reorder_subtasks(task.id, parent_subtask_id=None, ordered_subtask_ids=[])

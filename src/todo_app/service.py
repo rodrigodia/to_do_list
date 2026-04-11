@@ -124,6 +124,20 @@ class TaskService:
     def mark_subtask_done(self, subtask_id: int, done: bool) -> Subtask:
         return self.repository.mark_subtask_done(subtask_id, done)
 
+    def reorder_subtasks(
+        self,
+        task_id: int,
+        parent_subtask_id: int | None,
+        ordered_subtask_ids: list[int],
+    ) -> list[Subtask]:
+        if not ordered_subtask_ids:
+            raise ValidationError("A nova ordem de subtarefas nao pode ser vazia.")
+        return self.repository.reorder_subtasks(
+            task_id=task_id,
+            parent_subtask_id=parent_subtask_id,
+            ordered_subtask_ids=ordered_subtask_ids,
+        )
+
     def list_tasks(
         self,
         status: Status | str | None = None,

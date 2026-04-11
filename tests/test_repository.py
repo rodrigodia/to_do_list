@@ -1,5 +1,7 @@
 from datetime import date
 
+import pytest
+
 from todo_app.models import Priority, Status, SubtaskData, TaskData, TaskFilters
 from todo_app.repository import TaskRepository
 
@@ -167,6 +169,49 @@ def test_repository_update_subtask_description(tmp_path):
     repository.update_subtask(subtask.id, description="Versao final revista")
     loaded = repository.get_subtask(subtask.id)
     assert loaded.description == "Versao final revista"
+
+
+def test_repository_reorder_subtasks_by_parent_group(tmp_path):
+    repository = TaskRepository(tmp_path / "todo.db")
+    repository.migrate()
+    task = repository.create(TaskData(title="Backlog", priority=Priority.HIGH))
+    first = repository.create_subtask(task.id, "Primeira")
+    second = repository.create_subtask(task.id, "Segunda")
+    third = repository.create_subtask(task.id, "Terceira")
+    child_a = repository.create_subtask(task.id, "Filha A", parent_subtask_id=first.id)
+    child_b = repository.create_subtask(task.id, "Filha B", parent_subtask_id=first.id)
+
+    repository.reorder_subtasks(
+        task_id=task.id,
+        parent_subtask_id=None,
+        ordered_subtask_ids=[third.id, first.id, second.id],
+    )
+    repository.reorder_subtasks(
+        task_id=task.id,
+        parent_subtask_id=first.id,
+        ordered_subtask_ids=[child_b.id, child_a.id],
+    )
+
+    ordered = repository.list_subtasks(task.id)
+    top_level = [sub.id for sub in ordered if sub.parent_subtask_id is None]
+    children = [sub.id for sub in ordered if sub.parent_subtask_id == first.id]
+    assert top_level == [third.id, first.id, second.id]
+    assert children == [child_b.id, child_a.id]
+
+
+def test_repository_reorder_subtasks_rejects_incomplete_group(tmp_path):
+    repository = TaskRepository(tmp_path / "todo.db")
+    repository.migrate()
+    task = repository.create(TaskData(title="Planeamento", priority=Priority.MEDIUM))
+    first = repository.create_subtask(task.id, "A")
+    repository.create_subtask(task.id, "B")
+
+    with pytest.raises(ValueError):
+        repository.reorder_subtasks(
+            task_id=task.id,
+            parent_subtask_id=None,
+            ordered_subtask_ids=[first.id],
+        )
 
 
 def test_repository_persistence_across_restarts(tmp_path):

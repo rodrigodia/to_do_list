@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Callable
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont, QKeySequence, QShortcut
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QDropEvent, QFont, QKeySequence, QMouseEvent, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -27,6 +28,85 @@ from todo_app.ui.task_dialog import TaskDialog
 ROLE_ENTITY_TYPE = Qt.UserRole
 ROLE_ENTITY_ID = Qt.UserRole + 1
 ROLE_TASK_ID = Qt.UserRole + 2
+ROLE_PARENT_SUBTASK_ID = Qt.UserRole + 3
+ROLE_DEPTH = Qt.UserRole + 4
+
+DropTargetResolver = Callable[[int, int], int | None]
+
+
+class ReorderTableWidget(QTableWidget):
+    row_reordered = Signal()
+
+    def __init__(self, rows: int, columns: int, parent: QWidget | None = None) -> None:
+        super().__init__(rows, columns, parent)
+        self._drag_source_row: int | None = None
+        self._drop_target_resolver: DropTargetResolver | None = None
+
+    def set_drop_target_resolver(self, resolver: DropTargetResolver) -> None:
+        self._drop_target_resolver = resolver
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton:
+            self._drag_source_row = self.rowAt(int(event.position().y()))
+        super().mousePressEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        if event.source() is not self:
+            super().dropEvent(event)
+            return
+
+        source_row = self._drag_source_row if self._drag_source_row is not None else self.currentRow()
+        self._drag_source_row = None
+        if source_row < 0:
+            event.ignore()
+            return
+
+        if self._drop_target_resolver is None:
+            event.ignore()
+            return
+
+        target_row = self._drop_target_resolver(source_row, int(event.position().y()))
+        if target_row is None:
+            event.ignore()
+            return
+
+        moved_row = self._move_row(source_row, target_row)
+        if moved_row is None:
+            event.ignore()
+            return
+
+        self.clearSelection()
+        self.selectRow(moved_row)
+        self.setCurrentCell(moved_row, 1)
+        self.row_reordered.emit()
+        event.acceptProposedAction()
+
+    def _move_row(self, source_row: int, target_row: int) -> int | None:
+        row_count = self.rowCount()
+        if source_row < 0 or source_row >= row_count:
+            return None
+
+        bounded_target = max(0, min(target_row, row_count))
+        if bounded_target in {source_row, source_row + 1}:
+            return None
+
+        was_blocked = self.signalsBlocked()
+        self.blockSignals(True)
+        try:
+            row_items: list[QTableWidgetItem | None] = []
+            for col in range(self.columnCount()):
+                item = self.item(source_row, col)
+                row_items.append(item.clone() if item is not None else None)
+            self.removeRow(source_row)
+
+            insert_row = bounded_target - 1 if source_row < bounded_target else bounded_target
+            self.insertRow(insert_row)
+            for col, item in enumerate(row_items):
+                if item is not None:
+                    self.setItem(insert_row, col, item)
+            return insert_row
+        finally:
+            self.blockSignals(was_blocked)
 
 
 class MainWindow(QMainWindow):
@@ -80,7 +160,7 @@ class MainWindow(QMainWindow):
         filters_bar.addWidget(self.sort_filter)
         layout.addLayout(filters_bar)
 
-        self.table = QTableWidget(0, 6)
+        self.table = ReorderTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
             ["Feita", "Titulo", "Prioridade", "Data limite", "Subtarefas", "Atualizada"]
         )
@@ -90,6 +170,13 @@ class MainWindow(QMainWindow):
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setWordWrap(True)
         self.table.setTextElideMode(Qt.ElideNone)
+        self.table.setDragEnabled(True)
+        self.table.setAcceptDrops(True)
+        self.table.viewport().setAcceptDrops(True)
+        self.table.setDropIndicatorShown(True)
+        self.table.setDragDropOverwriteMode(False)
+        self.table.setDragDropMode(QAbstractItemView.InternalMove)
+        self.table.setDefaultDropAction(Qt.MoveAction)
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -111,6 +198,8 @@ class MainWindow(QMainWindow):
         self.search_input.textChanged.connect(self.refresh_tasks)
         self.sort_filter.currentIndexChanged.connect(self.refresh_tasks)
         self.table.itemChanged.connect(self._on_item_changed)
+        self.table.row_reordered.connect(self._on_rows_moved)
+        self.table.set_drop_target_resolver(self._resolve_drop_target_row)
         self.table.itemDoubleClicked.connect(lambda _: self._edit_selected_item())
         self.delete_shortcut = QShortcut(QKeySequence(Qt.Key_Delete), self.table)
         self.delete_shortcut.activated.connect(self._delete_selected_item)
@@ -148,11 +237,13 @@ class MainWindow(QMainWindow):
             entity_type="task",
             entity_id=task.id,
             task_id=task.id,
+            parent_subtask_id=None,
+            depth=0,
         )
         self.table.setItem(row, 0, checkbox_item)
 
         title_item = QTableWidgetItem(task.title)
-        self._set_item_identity(title_item, "task", task.id, task.id)
+        self._set_item_identity(title_item, "task", task.id, task.id, parent_subtask_id=None, depth=0)
         self.table.setItem(row, 1, title_item)
 
         self.table.setItem(row, 2, QTableWidgetItem(priority_label_pt(task.priority)))
@@ -166,6 +257,7 @@ class MainWindow(QMainWindow):
         )
         self.table.setItem(row, 4, QTableWidgetItem(progress_text))
         self.table.setItem(row, 5, QTableWidgetItem(_format_datetime(task.updated_at)))
+        self._set_row_drag_enabled(row, enabled=False)
 
         if task.status is Status.DONE:
             self._strike_row_text(row)
@@ -193,6 +285,8 @@ class MainWindow(QMainWindow):
             entity_type="subtask",
             entity_id=subtask.id,
             task_id=task_id,
+            parent_subtask_id=subtask.parent_subtask_id,
+            depth=depth,
         )
         self.table.setItem(row, 0, checkbox_item)
 
@@ -201,7 +295,14 @@ class MainWindow(QMainWindow):
         title_item = QTableWidgetItem(title_text)
         if subtask.description:
             title_item.setToolTip(subtask.description)
-        self._set_item_identity(title_item, "subtask", subtask.id, task_id)
+        self._set_item_identity(
+            title_item,
+            "subtask",
+            subtask.id,
+            task_id,
+            parent_subtask_id=subtask.parent_subtask_id,
+            depth=depth,
+        )
         self.table.setItem(row, 1, title_item)
 
         self.table.setItem(row, 2, QTableWidgetItem(""))
@@ -210,6 +311,7 @@ class MainWindow(QMainWindow):
         child_text = "" if child_count == 0 else f"{child_count} sub"
         self.table.setItem(row, 4, QTableWidgetItem(child_text))
         self.table.setItem(row, 5, QTableWidgetItem(_format_datetime(subtask.updated_at)))
+        self._set_row_drag_enabled(row, enabled=True)
 
         if subtask.status is Status.DONE:
             self._strike_row_text(row)
@@ -218,20 +320,53 @@ class MainWindow(QMainWindow):
             self._append_subtask_recursive(task_id, child, children_by_parent, depth=depth + 1)
 
     def _build_check_item(
-        self, done: bool, entity_type: str, entity_id: int, task_id: int
+        self,
+        done: bool,
+        entity_type: str,
+        entity_id: int,
+        task_id: int,
+        parent_subtask_id: int | None,
+        depth: int,
     ) -> QTableWidgetItem:
         checkbox_item = QTableWidgetItem("")
         checkbox_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
         checkbox_item.setCheckState(Qt.Checked if done else Qt.Unchecked)
-        self._set_item_identity(checkbox_item, entity_type, entity_id, task_id)
+        self._set_item_identity(
+            checkbox_item,
+            entity_type,
+            entity_id,
+            task_id,
+            parent_subtask_id=parent_subtask_id,
+            depth=depth,
+        )
         return checkbox_item
 
     def _set_item_identity(
-        self, item: QTableWidgetItem, entity_type: str, entity_id: int, task_id: int
+        self,
+        item: QTableWidgetItem,
+        entity_type: str,
+        entity_id: int,
+        task_id: int,
+        parent_subtask_id: int | None,
+        depth: int,
     ) -> None:
         item.setData(ROLE_ENTITY_TYPE, entity_type)
         item.setData(ROLE_ENTITY_ID, entity_id)
         item.setData(ROLE_TASK_ID, task_id)
+        item.setData(ROLE_PARENT_SUBTASK_ID, parent_subtask_id)
+        item.setData(ROLE_DEPTH, depth)
+
+    def _set_row_drag_enabled(self, row: int, enabled: bool) -> None:
+        for column in range(self.table.columnCount()):
+            item = self.table.item(row, column)
+            if item is None:
+                continue
+            flags = item.flags() | Qt.ItemIsDropEnabled
+            if enabled:
+                flags |= Qt.ItemIsDragEnabled
+            else:
+                flags &= ~Qt.ItemIsDragEnabled
+            item.setFlags(flags)
 
     def _strike_row_text(self, row: int) -> None:
         for column in (1, 2, 3, 4, 5):
@@ -259,6 +394,164 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "Erro", str(exc))
             self.refresh_tasks()
+
+    def _resolve_drop_target_row(self, source_row: int, drop_y: int) -> int | None:
+        source = self._row_identity(source_row)
+        if source is None or source["entity_type"] != "subtask":
+            return None
+
+        task_id = int(source["task_id"])
+        parent_subtask_id = source["parent_subtask_id"]
+        sibling_rows = [
+            row
+            for row in range(self.table.rowCount())
+            if (
+                (row_identity := self._row_identity(row)) is not None
+                and row_identity["entity_type"] == "subtask"
+                and int(row_identity["task_id"]) == task_id
+                and row_identity["parent_subtask_id"] == parent_subtask_id
+            )
+        ]
+        if len(sibling_rows) <= 1:
+            return source_row
+
+        hovered_row = self.table.rowAt(drop_y)
+        if hovered_row < 0:
+            target_row = (
+                sibling_rows[0]
+                if drop_y < self._gap_y(sibling_rows[0])
+                else self._subtree_end_row(sibling_rows[-1])
+            )
+        else:
+            reference_row = (
+                hovered_row
+                if hovered_row in sibling_rows
+                else min(sibling_rows, key=lambda row: abs(drop_y - self._row_center_y(row)))
+            )
+            target_row = (
+                reference_row
+                if drop_y < self._row_center_y(reference_row)
+                else self._subtree_end_row(reference_row)
+            )
+
+        source_index = sibling_rows.index(source_row)
+        target_index = self._slot_index_from_row(sibling_rows, target_row)
+        if target_index in {source_index, source_index + 1}:
+            return source_row
+        return target_row
+
+    def _row_identity(self, row: int) -> dict[str, int | str | None] | None:
+        title_item = self.table.item(row, 1)
+        if title_item is None:
+            return None
+        entity_type = title_item.data(ROLE_ENTITY_TYPE)
+        entity_id = title_item.data(ROLE_ENTITY_ID)
+        task_id = title_item.data(ROLE_TASK_ID)
+        parent_raw = title_item.data(ROLE_PARENT_SUBTASK_ID)
+        depth_raw = title_item.data(ROLE_DEPTH)
+        if entity_type not in {"task", "subtask"}:
+            return None
+        if entity_id is None or task_id is None or depth_raw is None:
+            return None
+        return {
+            "entity_type": str(entity_type),
+            "entity_id": int(entity_id),
+            "task_id": int(task_id),
+            "parent_subtask_id": int(parent_raw) if parent_raw is not None else None,
+            "depth": int(depth_raw),
+        }
+
+    def _subtree_end_row(self, row: int) -> int:
+        start = self._row_identity(row)
+        if start is None or start["entity_type"] != "subtask":
+            return row + 1
+
+        task_id = int(start["task_id"])
+        start_depth = int(start["depth"])
+        cursor = row + 1
+        while cursor < self.table.rowCount():
+            current = self._row_identity(cursor)
+            if current is None:
+                break
+            if int(current["task_id"]) != task_id:
+                break
+            if current["entity_type"] != "subtask":
+                break
+            if int(current["depth"]) <= start_depth:
+                break
+            cursor += 1
+        return cursor
+
+    def _gap_y(self, row: int) -> int:
+        row_count = self.table.rowCount()
+        if row_count == 0:
+            return 0
+        if row <= 0:
+            return self.table.visualRect(self.table.model().index(0, 0)).top()
+        if row >= row_count:
+            return self.table.visualRect(self.table.model().index(row_count - 1, 0)).bottom() + 1
+        return self.table.visualRect(self.table.model().index(row, 0)).top()
+
+    def _row_center_y(self, row: int) -> int:
+        rect = self.table.visualRect(self.table.model().index(row, 0))
+        return rect.center().y()
+
+    def _slot_index_from_row(self, sibling_rows: list[int], target_row: int) -> int:
+        for idx, row in enumerate(sibling_rows):
+            if target_row <= row:
+                return idx
+        return len(sibling_rows)
+
+    def _on_rows_moved(self, *_: object) -> None:
+        if self._loading_table:
+            return
+
+        try:
+            changed = self._persist_visible_subtask_order()
+        except (ValidationError, ValueError) as exc:
+            QMessageBox.warning(self, "Erro", str(exc))
+            self.refresh_tasks()
+            return
+
+        if changed:
+            self.refresh_tasks()
+
+    def _persist_visible_subtask_order(self) -> bool:
+        grouped_order: dict[tuple[int, int | None], list[int]] = {}
+        for row in range(self.table.rowCount()):
+            title_item = self.table.item(row, 1)
+            if title_item is None:
+                continue
+            if title_item.data(ROLE_ENTITY_TYPE) != "subtask":
+                continue
+            task_id = int(title_item.data(ROLE_TASK_ID))
+            subtask_id = int(title_item.data(ROLE_ENTITY_ID))
+            parent_raw = title_item.data(ROLE_PARENT_SUBTASK_ID)
+            parent_subtask_id = int(parent_raw) if parent_raw is not None else None
+            grouped_order.setdefault((task_id, parent_subtask_id), []).append(subtask_id)
+
+        if not grouped_order:
+            return False
+
+        existing_order_by_group: dict[tuple[int, int | None], list[int]] = {}
+        for task_id in sorted({task_id for task_id, _ in grouped_order}):
+            for subtask in self.service.list_subtasks(task_id):
+                key = (task_id, subtask.parent_subtask_id)
+                existing_order_by_group.setdefault(key, []).append(subtask.id)
+
+        changed = False
+        for key, new_order in grouped_order.items():
+            if existing_order_by_group.get(key, []) == new_order:
+                continue
+            task_id, parent_subtask_id = key
+            self.service.reorder_subtasks(
+                task_id=task_id,
+                parent_subtask_id=parent_subtask_id,
+                ordered_subtask_ids=new_order,
+            )
+            changed = True
+
+        return changed
 
     def _create_task(self) -> None:
         dialog = TaskDialog(self)

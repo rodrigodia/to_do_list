@@ -482,6 +482,40 @@ class TaskRepository:
             raise ValueError(f"Subtarefa com id {subtask_id} nao existe.")
         return _row_to_subtask(row)
 
+    def reorder_subtasks(
+        self,
+        task_id: int,
+        parent_subtask_id: int | None,
+        ordered_subtask_ids: list[int],
+    ) -> list[Subtask]:
+        if not ordered_subtask_ids:
+            raise ValueError("A nova ordem de subtarefas nao pode ser vazia.")
+
+        with self._connect() as conn:
+            _ensure_task_exists(conn, task_id)
+            if parent_subtask_id is not None:
+                _ensure_parent_belongs_to_task(conn, task_id, parent_subtask_id)
+
+            sibling_ids = _list_subtask_ids_by_parent(conn, task_id, parent_subtask_id)
+            if len(sibling_ids) != len(ordered_subtask_ids) or set(sibling_ids) != set(
+                ordered_subtask_ids
+            ):
+                raise ValueError("A nova ordem de subtarefas e invalida.")
+            if sibling_ids == ordered_subtask_ids:
+                return self.list_subtasks(task_id)
+
+            now = _now_iso()
+            for idx, subtask_id in enumerate(ordered_subtask_ids):
+                conn.execute(
+                    "UPDATE subtasks SET position = ?, updated_at = ? WHERE id = ?",
+                    (idx, now, subtask_id),
+                )
+
+            _touch_task(conn, task_id)
+            conn.commit()
+
+        return self.list_subtasks(task_id)
+
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.execute("PRAGMA foreign_keys = ON")
@@ -599,6 +633,33 @@ def _next_subtask_position(
 
 def _touch_task(conn: sqlite3.Connection, task_id: int) -> None:
     conn.execute("UPDATE tasks SET updated_at = ? WHERE id = ?", (_now_iso(), task_id))
+
+
+def _list_subtask_ids_by_parent(
+    conn: sqlite3.Connection, task_id: int, parent_subtask_id: int | None
+) -> list[int]:
+    conn.row_factory = sqlite3.Row
+    if parent_subtask_id is None:
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM subtasks
+            WHERE task_id = ? AND parent_subtask_id IS NULL
+            ORDER BY position ASC, id ASC
+            """,
+            (task_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM subtasks
+            WHERE task_id = ? AND parent_subtask_id = ?
+            ORDER BY position ASC, id ASC
+            """,
+            (task_id, parent_subtask_id),
+        ).fetchall()
+    return [int(row["id"]) for row in rows]
 
 
 def _ensure_subtasks_compat_columns(conn: sqlite3.Connection) -> None:
