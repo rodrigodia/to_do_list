@@ -137,8 +137,12 @@ def test_repository_filters_and_search(tmp_path):
     repository.replace_subtasks(
         first.id,
         [
-            SubtaskData(title="Passar no supermercado", description="Levar cupoes", status=Status.TODO),
-            SubtaskData(title="Pagar caixa", description="Confirmar desconto fidelidade", status=Status.TODO),
+            SubtaskData(
+                title="Passar no supermercado", description="Levar cupoes", status=Status.TODO
+            ),
+            SubtaskData(
+                title="Pagar caixa", description="Confirmar desconto fidelidade", status=Status.TODO
+            ),
         ],
     )
 
@@ -212,6 +216,137 @@ def test_repository_reorder_subtasks_rejects_incomplete_group(tmp_path):
             parent_subtask_id=None,
             ordered_subtask_ids=[first.id],
         )
+
+
+def test_repository_closes_connections(tmp_path):
+    db_path = tmp_path / "todo.db"
+    repository = TaskRepository(db_path)
+    repository.migrate()
+    task = repository.create(TaskData(title="Fechar ligacoes"))
+    repository.create_subtask(task.id, "Sub")
+    repository.list(filters=TaskFilters(query="fechar"))
+    repository.list_subtasks_for_tasks([task.id])
+    repository.delete_many([task.id], [])
+
+    # No Windows, um ficheiro com ligacoes abertas nao pode ser apagado.
+    db_path.unlink()
+    assert not db_path.exists()
+
+
+def test_repository_rolls_back_failed_operation(tmp_path):
+    repository = TaskRepository(tmp_path / "todo.db")
+    repository.migrate()
+
+    with pytest.raises(ValueError):
+        repository.mark_done(999, True)
+    with pytest.raises(ValueError):
+        repository.create_subtask(999, "Orfa")
+
+    assert repository.list() == []
+
+
+def test_repository_list_subtasks_for_tasks_groups_by_task(tmp_path):
+    repository = TaskRepository(tmp_path / "todo.db")
+    repository.migrate()
+    first = repository.create(TaskData(title="A"))
+    second = repository.create(TaskData(title="B"))
+    empty = repository.create(TaskData(title="C"))
+    a1 = repository.create_subtask(first.id, "A1")
+    a2 = repository.create_subtask(first.id, "A2")
+    a1_child = repository.create_subtask(first.id, "A1.1", parent_subtask_id=a1.id)
+    b1 = repository.create_subtask(second.id, "B1")
+    repository.reorder_subtasks(first.id, None, [a2.id, a1.id])
+
+    grouped = repository.list_subtasks_for_tasks([first.id, second.id, empty.id])
+
+    assert [sub.id for sub in grouped[first.id]] == [
+        sub.id for sub in repository.list_subtasks(first.id)
+    ]
+    assert {sub.id for sub in grouped[first.id]} == {a1.id, a2.id, a1_child.id}
+    assert [sub.id for sub in grouped[second.id]] == [b1.id]
+    assert grouped[empty.id] == []
+    assert repository.list_subtasks_for_tasks([]) == {}
+
+
+def test_repository_delete_many_and_restore_roundtrip(tmp_path):
+    repository = TaskRepository(tmp_path / "todo.db")
+    repository.migrate()
+    kept = repository.create(TaskData(title="Fica", due_date=date(2026, 1, 2)))
+    removed = repository.create(
+        TaskData(
+            title="Sai", description="Notas", priority=Priority.HIGH, due_date=date(2026, 5, 1)
+        )
+    )
+    root = repository.create_subtask(removed.id, "Raiz", description="desc")
+    child = repository.create_subtask(removed.id, "Filha", parent_subtask_id=root.id)
+    repository.create_subtask(removed.id, "Neta", parent_subtask_id=child.id)
+    repository.mark_subtask_done(child.id, True)
+    kept_root = repository.create_subtask(kept.id, "Mantida")
+    kept_branch = repository.create_subtask(kept.id, "Ramo")
+    repository.create_subtask(kept.id, "Folha", parent_subtask_id=kept_branch.id)
+    repository.reorder_subtasks(kept.id, None, [kept_branch.id, kept_root.id])
+
+    before_tasks = {task.id: task for task in repository.list()}
+    before_subtasks = {
+        task_id: repository.list_subtasks(task_id) for task_id in (kept.id, removed.id)
+    }
+
+    # Selecao mista e redundante: a subtarefa `child` ja vai com a tarefa `removed`.
+    snapshot = repository.delete_many([removed.id], [child.id, kept_branch.id])
+
+    assert {task.id for task in snapshot.tasks} == {removed.id}
+    assert len(snapshot.subtasks) == 5
+    assert [task.id for task in repository.list()] == [kept.id]
+    assert [sub.id for sub in repository.list_subtasks(kept.id)] == [kept_root.id]
+
+    repository.restore(snapshot)
+
+    after_tasks = {task.id: task for task in repository.list()}
+    assert after_tasks.keys() == before_tasks.keys()
+    restored = after_tasks[removed.id]
+    original = before_tasks[removed.id]
+    assert (restored.title, restored.description, restored.priority, restored.due_date) == (
+        original.title,
+        original.description,
+        original.priority,
+        original.due_date,
+    )
+    assert restored.created_at == original.created_at
+    assert (restored.subtask_total, restored.subtask_done) == (3, 2)
+    for task_id in (kept.id, removed.id):
+        after = repository.list_subtasks(task_id)
+        assert [
+            (s.id, s.parent_subtask_id, s.title, s.description, s.status, s.position) for s in after
+        ] == [
+            (s.id, s.parent_subtask_id, s.title, s.description, s.status, s.position)
+            for s in before_subtasks[task_id]
+        ]
+
+
+def test_repository_delete_many_ignores_missing_ids(tmp_path):
+    repository = TaskRepository(tmp_path / "todo.db")
+    repository.migrate()
+    task = repository.create(TaskData(title="Unica"))
+
+    snapshot = repository.delete_many([task.id, 999], [888])
+
+    assert [t.id for t in snapshot.tasks] == [task.id]
+    assert snapshot.subtasks == []
+    assert repository.delete_many([], []).is_empty
+
+
+def test_repository_restore_fails_cleanly_when_parent_is_gone(tmp_path):
+    repository = TaskRepository(tmp_path / "todo.db")
+    repository.migrate()
+    task = repository.create(TaskData(title="Pai"))
+    sub = repository.create_subtask(task.id, "Filha")
+
+    snapshot = repository.delete_many([], [sub.id])
+    repository.delete(task.id)
+
+    with pytest.raises(ValueError):
+        repository.restore(snapshot)
+    assert repository.list() == []
 
 
 def test_repository_persistence_across_restarts(tmp_path):

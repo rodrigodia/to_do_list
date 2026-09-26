@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 
 from todo_app.models import (
+    DeletionSnapshot,
     Priority,
     SortOption,
     Status,
@@ -78,6 +79,15 @@ class TaskService:
 
     def list_subtasks(self, task_id: int) -> list[Subtask]:
         return self.repository.list_subtasks(task_id)
+
+    def list_subtasks_for_tasks(self, task_ids: list[int]) -> dict[int, list[Subtask]]:
+        return self.repository.list_subtasks_for_tasks(task_ids)
+
+    def delete_items(self, task_ids: list[int], subtask_ids: list[int]) -> DeletionSnapshot:
+        return self.repository.delete_many(task_ids, subtask_ids)
+
+    def restore_deleted(self, snapshot: DeletionSnapshot) -> None:
+        self.repository.restore(snapshot)
 
     def get_subtask(self, subtask_id: int) -> Subtask:
         return self.repository.get_subtask(subtask_id)

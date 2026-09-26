@@ -141,9 +141,16 @@ Nota: concluir todas as subtarefas **não** conclui automaticamente a tarefa pri
 
 - É possível selecionar várias tarefas e/ou subtarefas e apagá-las de uma vez.
 - Se uma tarefa e subtarefas dessa mesma tarefa estiverem selecionadas, as subtarefas são descartadas da operação (já vão ser apagadas em cascata).
-- As tarefas são apagadas antes das subtarefas; erros de "já não existe" provocados por cascatas são ignorados.
+- Tudo é apagado numa única transação; IDs que já não existem são ignorados.
 
-### 4.6 Validações (camada de serviço)
+### 4.6 Desfazer apagamentos
+
+- Antes de apagar, a aplicação guarda uma cópia de tudo o que vai ser removido (tarefas, subtarefas e descendentes, com IDs, estados, posições e datas originais).
+- `Desfazer` / `Ctrl+Z` restaura o último apagamento, exatamente como estava. Podem desfazer-se até 20 apagamentos, do mais recente para o mais antigo.
+- Depois de restaurar, os itens recuperados ficam selecionados.
+- O histórico de desfazer existe só enquanto a aplicação está aberta.
+
+### 4.7 Validações (camada de serviço)
 
 - Título da tarefa obrigatório (após remover espaços) → `"O titulo da tarefa e obrigatorio."`
 - Título da subtarefa obrigatório → `"As subtarefas precisam de titulo."`
@@ -158,14 +165,25 @@ Nota: concluir todas as subtarefas **não** conclui automaticamente a tarefa pri
 
 ### Layout da janela
 
-1. **Barra de ações:** `Nova tarefa`, `Nova subtarefa`, `Editar`, `Apagar`.
-2. **Barra de filtros:** estado, prioridade, caixa de pesquisa e ordenação. Qualquer alteração atualiza a lista imediatamente (a pesquisa atualiza a cada tecla).
+1. **Barra de ações:** `Nova tarefa`, `Nova subtarefa`, `Editar`, `Apagar`, `Desfazer`.
+2. **Barra de filtros:** estado, prioridade, caixa de pesquisa e ordenação. Os filtros atualizam a lista de imediato; a pesquisa espera 250 ms depois da última tecla, para não consultar a base de dados a cada letra.
 3. **Tabela** com as colunas: `Feita`, `Titulo`, `Prioridade`, `Data limite`, `Subtarefas`, `Atualizada`.
-   - As subtarefas aparecem logo abaixo da tarefa, indentadas por nível (`- titulo`).
+   - Cada tarefa e as suas subtarefas formam um **grupo visual**:
+     - a linha da tarefa funciona como cabeçalho (título a negrito e fundo mais forte, com a descrição em tooltip);
+     - há um separador acima de cada tarefa;
+     - uma barra vertical à esquerda, com a cor da prioridade (cinzenta se concluída), percorre o grupo inteiro;
+     - os grupos alternam de cor de fundo (em vez de alternar linha a linha).
+     As cores derivam da paleta do sistema, por isso funcionam em tema claro e escuro.
+   - As subtarefas aparecem logo abaixo da tarefa, com conectores de árvore (`├─`, `└─`, `│`) que mostram a hierarquia.
    - Para subtarefas, a coluna "Subtarefas" mostra o nº de filhas diretas (ex.: `2 sub`).
    - A descrição da subtarefa aparece como tooltip no título.
+   - A prioridade tem cor: Alta a vermelho, Média a laranja, Baixa a verde.
+   - Tarefas por fazer com a data limite ultrapassada mostram a data a vermelho e negrito, com `(atrasada)`.
    - Itens concluídos aparecem **riscados**.
-4. **Barra de estado:** número de tarefas mostradas.
+   - Depois de qualquer ação, a seleção, a linha atual e a posição do scroll mantêm-se. Ao criar uma tarefa ou subtarefa, a nova linha fica selecionada e visível.
+4. **Barra de estado:** número de tarefas mostradas (à direita) e mensagens temporárias, como "3 item(ns) apagado(s). Ctrl+Z para desfazer."
+
+A lista é carregada com duas queries (tarefas + todas as subtarefas dessas tarefas), independentemente do número de tarefas.
 
 ### Interações
 
@@ -176,6 +194,7 @@ Nota: concluir todas as subtarefas **não** conclui automaticamente a tarefa pri
 | Nova subtarefa | Selecionar uma tarefa (cria no 1.º nível) ou subtarefa (cria como filha) e carregar em `Nova subtarefa` ou `Ctrl+S` |
 | Editar | Botão `Editar` ou **duplo clique** na linha |
 | Apagar | Botão `Apagar` ou tecla `Delete` — pede confirmação com mensagem adaptada ao nº de tarefas/subtarefas selecionadas |
+| Desfazer apagamento | Botão `Desfazer` ou `Ctrl+Z` |
 | Seleção múltipla | `Ctrl+clique` / `Shift+clique` |
 | Reordenar subtarefas | Arrastar e largar uma subtarefa; só pode ser movida entre irmãs (mesmo pai), e leva consigo a sua sub-árvore. Tarefas não são arrastáveis. A nova ordem é gravada de imediato. |
 
@@ -220,13 +239,18 @@ pip install -e .[dev]
 ### Dependências
 
 - Runtime: `PySide6`.
-- Dev: `pytest`, `ruff`, `black`, `pyinstaller`.
+- Dev: `pytest`, `pytest-qt`, `ruff`, `black`, `pyinstaller`.
+
+### Ligações à base de dados
+
+Cada operação abre uma ligação SQLite, faz commit se correr bem ou rollback se falhar, e **fecha sempre a ligação** (`TaskRepository._connect`).
 
 ### Testes
 
 | Ficheiro | Cobre |
 |----------|-------|
-| `tests/test_repository.py` | CRUD, cascata de apagamento, cascatas de estado (descendentes e antepassados), filtros e pesquisa, descrição de subtarefas, reordenação e validação da nova ordem, persistência após reinício |
+| `tests/test_repository.py` | CRUD, cascata de apagamento, cascatas de estado (descendentes e antepassados), filtros e pesquisa, descrição de subtarefas, reordenação e validação da nova ordem, persistência após reinício, fecho das ligações, rollback em erro, carregamento de subtarefas em lote, apagar em lote + restaurar (ida e volta completa), restauro que falha sem deixar lixo |
 | `tests/test_service.py` | Validação de título e data, fluxo editar/concluir/apagar/filtrar, subtarefas aninhadas, cascatas de estado, trim da descrição, reordenação |
+| `tests/test_main_window.py` | Interface real com `pytest-qt`: árvore de subtarefas, grupos visuais (fundos, barra de prioridade, cabeçalho a negrito), clique real do rato na checkbox, cores e datas atrasadas, pesquisa com espera (uma só query), pesquisa em subtarefas, manter seleção e scroll, cascata ao marcar pela checkbox, criar tarefa/subtarefa (incluindo `Ctrl+S`), apagar seleção mista + desfazer, cancelar apagamento, vários `Ctrl+Z` seguidos, drag & drop (reordenar, mover sub-árvore, recusar tarefas e mudanças de pai) |
 
-Os testes usam uma base de dados temporária (`tmp_path`), por isso não tocam nos dados reais.
+Os testes usam uma base de dados temporária (`tmp_path`), por isso não tocam nos dados reais. Os testes de interface correm sem abrir janelas (`QT_QPA_PLATFORM=offscreen`, definido em `tests/conftest.py`).

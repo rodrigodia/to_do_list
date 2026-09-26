@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 from todo_app.models import (
+    DeletionSnapshot,
     Priority,
     SortOption,
     Status,
@@ -167,7 +170,9 @@ class TaskRepository:
         if cursor.rowcount == 0:
             raise ValueError(f"Tarefa com id {task_id} nao existe.")
 
-    def list(self, filters: TaskFilters | None = None, sort: SortOption = "created_desc") -> list[Task]:
+    def list(
+        self, filters: TaskFilters | None = None, sort: SortOption = "created_desc"
+    ) -> list[Task]:
         filters = filters or TaskFilters()
         where_parts: list[str] = []
         params: list[object] = []
@@ -370,7 +375,9 @@ class TaskRepository:
             if subtask is None:
                 raise ValueError(f"Subtarefa com id {subtask_id} nao existe.")
             new_title = title if title is not None else str(subtask["title"])
-            new_description = description if description is not None else str(subtask["description"])
+            new_description = (
+                description if description is not None else str(subtask["description"])
+            )
             conn.execute(
                 "UPDATE subtasks SET title = ?, description = ?, updated_at = ? WHERE id = ?",
                 (new_title, new_description, _now_iso(), subtask_id),
@@ -516,10 +523,165 @@ class TaskRepository:
 
         return self.list_subtasks(task_id)
 
-    def _connect(self) -> sqlite3.Connection:
+    def list_subtasks_for_tasks(self, task_ids: list[int]) -> dict[int, list[Subtask]]:
+        grouped: dict[int, list[Subtask]] = {task_id: [] for task_id in task_ids}
+        if not task_ids:
+            return grouped
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"""
+                SELECT
+                    id,
+                    task_id,
+                    parent_subtask_id,
+                    title,
+                    description,
+                    status,
+                    position,
+                    created_at,
+                    updated_at
+                FROM subtasks
+                WHERE task_id IN ({_placeholders(task_ids)})
+                ORDER BY task_id ASC, position ASC, id ASC
+                """,
+                tuple(task_ids),
+            ).fetchall()
+        for row in rows:
+            subtask = _row_to_subtask(row)
+            grouped.setdefault(subtask.task_id, []).append(subtask)
+        return grouped
+
+    def delete_many(self, task_ids: list[int], subtask_ids: list[int]) -> DeletionSnapshot:
+        """Apaga tarefas e subtarefas (com descendentes) e devolve o que foi apagado."""
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            task_rows = conn.execute(
+                f"""
+                SELECT id, title, description, priority, due_date, status, created_at, updated_at
+                FROM tasks
+                WHERE id IN ({_placeholders(task_ids)})
+                """,
+                tuple(task_ids),
+            ).fetchall()
+            subtask_rows = conn.execute(
+                f"""
+                WITH RECURSIVE subtree(id) AS (
+                    SELECT id
+                    FROM subtasks
+                    WHERE id IN ({_placeholders(subtask_ids)})
+                    OR task_id IN ({_placeholders(task_ids)})
+                    UNION
+                    SELECT s.id
+                    FROM subtasks s
+                    JOIN subtree st ON s.parent_subtask_id = st.id
+                )
+                SELECT
+                    id,
+                    task_id,
+                    parent_subtask_id,
+                    title,
+                    description,
+                    status,
+                    position,
+                    created_at,
+                    updated_at
+                FROM subtasks
+                WHERE id IN (SELECT id FROM subtree)
+                ORDER BY id ASC
+                """,
+                (*subtask_ids, *task_ids),
+            ).fetchall()
+
+            snapshot = DeletionSnapshot(
+                tasks=[_row_to_task(row) for row in task_rows],
+                subtasks=[_row_to_subtask(row) for row in subtask_rows],
+            )
+            deleted_task_ids = [task.id for task in snapshot.tasks]
+            deleted_subtask_ids = [subtask.id for subtask in snapshot.subtasks]
+
+            conn.execute(
+                f"DELETE FROM subtasks WHERE id IN ({_placeholders(deleted_subtask_ids)})",
+                tuple(deleted_subtask_ids),
+            )
+            conn.execute(
+                f"DELETE FROM tasks WHERE id IN ({_placeholders(deleted_task_ids)})",
+                tuple(deleted_task_ids),
+            )
+            for task_id in _touched_task_ids(snapshot):
+                _touch_task(conn, task_id)
+            conn.commit()
+        return snapshot
+
+    def restore(self, snapshot: DeletionSnapshot) -> None:
+        try:
+            self._restore(snapshot)
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("Nao foi possivel restaurar os itens apagados.") from exc
+
+    def _restore(self, snapshot: DeletionSnapshot) -> None:
+        with self._connect() as conn:
+            for task in snapshot.tasks:
+                conn.execute(
+                    """
+                    INSERT INTO tasks
+                    (id, title, description, priority, due_date, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task.id,
+                        task.title,
+                        task.description,
+                        task.priority.value,
+                        task.due_date.isoformat() if task.due_date else None,
+                        task.status.value,
+                        task.created_at.isoformat(timespec="seconds"),
+                        task.updated_at.isoformat(timespec="seconds"),
+                    ),
+                )
+            for subtask in _parents_first(snapshot.subtasks):
+                conn.execute(
+                    """
+                    INSERT INTO subtasks
+                    (
+                        id,
+                        task_id,
+                        parent_subtask_id,
+                        title,
+                        description,
+                        status,
+                        position,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        subtask.id,
+                        subtask.task_id,
+                        subtask.parent_subtask_id,
+                        subtask.title,
+                        subtask.description,
+                        subtask.status.value,
+                        subtask.position,
+                        subtask.created_at.isoformat(timespec="seconds"),
+                        subtask.updated_at.isoformat(timespec="seconds"),
+                    ),
+                )
+            for task_id in _touched_task_ids(snapshot):
+                _touch_task(conn, task_id)
+            conn.commit()
+
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_path)
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            # O context manager da ligacao faz commit/rollback mas nao a fecha.
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
 
 def _resolve_order_by(sort: SortOption) -> str:
@@ -660,6 +822,30 @@ def _list_subtask_ids_by_parent(
             (task_id, parent_subtask_id),
         ).fetchall()
     return [int(row["id"]) for row in rows]
+
+
+def _placeholders(values: list[int]) -> str:
+    return ", ".join("?" for _ in values)
+
+
+def _touched_task_ids(snapshot: DeletionSnapshot) -> list[int]:
+    """Tarefas que continuam a existir mas cujas subtarefas mudaram."""
+    deleted_task_ids = {task.id for task in snapshot.tasks}
+    return sorted({sub.task_id for sub in snapshot.subtasks if sub.task_id not in deleted_task_ids})
+
+
+def _parents_first(subtasks: list[Subtask]) -> list[Subtask]:
+    by_id = {subtask.id: subtask for subtask in subtasks}
+
+    def depth(subtask: Subtask) -> int:
+        level = 0
+        parent_id = subtask.parent_subtask_id
+        while parent_id in by_id:
+            level += 1
+            parent_id = by_id[parent_id].parent_subtask_id
+        return level
+
+    return sorted(subtasks, key=lambda subtask: (depth(subtask), subtask.id))
 
 
 def _ensure_subtasks_compat_columns(conn: sqlite3.Connection) -> None:

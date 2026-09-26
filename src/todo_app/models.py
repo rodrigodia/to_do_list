@@ -81,6 +81,16 @@ class TaskWithSubtasks(Task):
 
 
 @dataclass(slots=True)
+class DeletionSnapshot:
+    tasks: list[Task] = field(default_factory=list)
+    subtasks: list[Subtask] = field(default_factory=list)
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.tasks and not self.subtasks
+
+
+@dataclass(slots=True)
 class TaskFilters:
     status: Status | None = None
     priority: Priority | None = None

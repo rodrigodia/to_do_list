@@ -1,26 +1,58 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Callable
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QDropEvent, QFont, QKeySequence, QMouseEvent, QShortcut
+from PySide6.QtCore import (
+    QEvent,
+    QItemSelectionModel,
+    QModelIndex,
+    QRect,
+    QSize,
+    Qt,
+    QTimer,
+    Signal,
+)
+from PySide6.QtGui import (
+    QColor,
+    QDropEvent,
+    QFont,
+    QKeySequence,
+    QMouseEvent,
+    QPainter,
+    QPalette,
+    QPen,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QHBoxLayout,
     QHeaderView,
+    QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from todo_app.models import PRIORITY_LABELS_PT, Priority, Status, Subtask, Task, priority_label_pt
+from todo_app.models import (
+    PRIORITY_LABELS_PT,
+    DeletionSnapshot,
+    Priority,
+    Status,
+    Subtask,
+    Task,
+    priority_label_pt,
+)
 from todo_app.service import TaskService, ValidationError
 from todo_app.ui.subtask_dialog import SubtaskDialog
 from todo_app.ui.task_dialog import TaskDialog
@@ -30,8 +62,105 @@ ROLE_ENTITY_ID = Qt.UserRole + 1
 ROLE_TASK_ID = Qt.UserRole + 2
 ROLE_PARENT_SUBTASK_ID = Qt.UserRole + 3
 ROLE_DEPTH = Qt.UserRole + 4
+ROLE_GROUP_ACCENT = Qt.UserRole + 5
+
+SEARCH_DEBOUNCE_MS = 250
+UNDO_STACK_LIMIT = 20
+STATUS_MESSAGE_MS = 8000
+
+PRIORITY_COLORS = {
+    Priority.HIGH: QColor("#c62828"),
+    Priority.MEDIUM: QColor("#ef6c00"),
+    Priority.LOW: QColor("#2e7d32"),
+}
+OVERDUE_COLOR = QColor("#c62828")
+
+# Intensidade (0-1) com que a cor do texto e misturada no fundo, para funcionar em
+# temas claros e escuros sem cores fixas.
+GROUP_ALT_TINT = 0.035
+TASK_HEADER_TINT = 0.09
+SEPARATOR_TINT = 0.35
+ACCENT_WIDTH = 4
+CHECK_COLUMN_OFFSET = ACCENT_WIDTH + 4
+
+TREE_BRANCH = "├─ "
+TREE_LAST = "└─ "
+TREE_PIPE = "│   "
+TREE_SPACE = "     "
 
 DropTargetResolver = Callable[[int, int], int | None]
+EntityKey = tuple[str, int]
+
+
+@dataclass(slots=True, frozen=True)
+class GroupStyle:
+    background: QColor
+    header_background: QColor
+    accent: QColor
+
+
+def _mix(base: QColor, other: QColor, amount: float) -> QColor:
+    return QColor.fromRgbF(
+        base.redF() + (other.redF() - base.redF()) * amount,
+        base.greenF() + (other.greenF() - base.greenF()) * amount,
+        base.blueF() + (other.blueF() - base.blueF()) * amount,
+    )
+
+
+class TaskGroupDelegate(QStyledItemDelegate):
+    """Desenha a barra de cor de cada grupo e o separador acima de cada tarefa."""
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        if index.column() == 0:
+            if option.state & QStyle.State_Selected:
+                gutter = option.palette.highlight()
+            else:
+                gutter = index.data(Qt.BackgroundRole) or option.palette.base()
+            painter.fillRect(option.rect, gutter)
+            super().paint(painter, self._shifted(option), index)
+            accent = index.data(ROLE_GROUP_ACCENT)
+            if accent is not None:
+                bar = QRect(
+                    option.rect.left(), option.rect.top(), ACCENT_WIDTH, option.rect.height()
+                )
+                painter.fillRect(bar, accent)
+        else:
+            super().paint(painter, option, index)
+
+        if index.row() > 0 and _is_task_row(index):
+            painter.save()
+            palette = option.palette
+            color = _mix(palette.color(QPalette.Base), palette.color(QPalette.Text), SEPARATOR_TINT)
+            painter.setPen(QPen(color, 1))
+            painter.drawLine(option.rect.topLeft(), option.rect.topRight())
+            painter.restore()
+
+    def editorEvent(
+        self,
+        event: QEvent,
+        model,
+        option: QStyleOptionViewItem,
+        index: QModelIndex,
+    ) -> bool:
+        if index.column() == 0:
+            option = self._shifted(option)
+        return super().editorEvent(event, model, option, index)
+
+    def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
+        size = super().sizeHint(option, index)
+        if index.column() == 0:
+            size.setWidth(size.width() + CHECK_COLUMN_OFFSET)
+        return size
+
+    @staticmethod
+    def _shifted(option: QStyleOptionViewItem) -> QStyleOptionViewItem:
+        shifted = QStyleOptionViewItem(option)
+        shifted.rect = option.rect.adjusted(CHECK_COLUMN_OFFSET, 0, 0, 0)
+        return shifted
+
+
+def _is_task_row(index: QModelIndex) -> bool:
+    return index.siblingAtColumn(1).data(ROLE_ENTITY_TYPE) == "task"
 
 
 class ReorderTableWidget(QTableWidget):
@@ -55,31 +184,37 @@ class ReorderTableWidget(QTableWidget):
             super().dropEvent(event)
             return
 
-        source_row = self._drag_source_row if self._drag_source_row is not None else self.currentRow()
+        source_row = (
+            self._drag_source_row if self._drag_source_row is not None else self.currentRow()
+        )
         self._drag_source_row = None
-        if source_row < 0:
+        if self.move_row_by_drop(source_row, int(event.position().y())):
+            event.acceptProposedAction()
+        else:
             event.ignore()
-            return
 
-        if self._drop_target_resolver is None:
-            event.ignore()
-            return
+    def move_row_by_drop(self, source_row: int, drop_y: int) -> bool:
+        """Move a linha como se tivesse sido largada na coordenada vertical drop_y."""
+        if source_row < 0 or self._drop_target_resolver is None:
+            return False
 
-        target_row = self._drop_target_resolver(source_row, int(event.position().y()))
+        target_row = self._drop_target_resolver(source_row, drop_y)
         if target_row is None:
-            event.ignore()
-            return
+            return False
 
         moved_row = self._move_row(source_row, target_row)
         if moved_row is None:
-            event.ignore()
-            return
+            return False
 
-        self.clearSelection()
-        self.selectRow(moved_row)
-        self.setCurrentCell(moved_row, 1)
+        # selectRow/setCurrentCell dependem das teclas modificadoras (ex.: Ctrl alterna a
+        # selecao), por isso a linha movida e selecionada diretamente no modelo de selecao.
+        selection_model = self.selectionModel()
+        selection_model.setCurrentIndex(
+            self.model().index(moved_row, 1),
+            QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+        )
         self.row_reordered.emit()
-        event.acceptProposedAction()
+        return True
 
     def _move_row(self, source_row: int, target_row: int) -> int | None:
         row_count = self.rowCount()
@@ -114,6 +249,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.service = service
         self._loading_table = False
+        self._undo_stack: list[DeletionSnapshot] = []
 
         self.setWindowTitle("To-Do List")
         self.resize(980, 620)
@@ -128,10 +264,13 @@ class MainWindow(QMainWindow):
         self.new_subtask_button = QPushButton("Nova subtarefa")
         self.edit_button = QPushButton("Editar")
         self.delete_button = QPushButton("Apagar")
+        self.undo_button = QPushButton("Desfazer")
+        self.undo_button.setEnabled(False)
         actions_bar.addWidget(self.new_button)
         actions_bar.addWidget(self.new_subtask_button)
         actions_bar.addWidget(self.edit_button)
         actions_bar.addWidget(self.delete_button)
+        actions_bar.addWidget(self.undo_button)
         actions_bar.addStretch()
         layout.addLayout(actions_bar)
 
@@ -166,7 +305,10 @@ class MainWindow(QMainWindow):
         )
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.table.setAlternatingRowColors(True)
+        # As cores alternam por grupo (tarefa + subtarefas), nao por linha.
+        self.table.setAlternatingRowColors(False)
+        self.table.setShowGrid(False)
+        self.table.setItemDelegate(TaskGroupDelegate(self.table))
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setWordWrap(True)
         self.table.setTextElideMode(Qt.ElideNone)
@@ -187,16 +329,23 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
         layout.addWidget(self.table)
 
-        self.statusBar().showMessage("Pronto")
+        self.task_count_label = QLabel()
+        self.statusBar().addPermanentWidget(self.task_count_label)
+
+        self.search_timer = QTimer(self)
+        self.search_timer.setSingleShot(True)
+        self.search_timer.setInterval(SEARCH_DEBOUNCE_MS)
+        self.search_timer.timeout.connect(self._on_filters_changed)
 
         self.new_button.clicked.connect(self._create_task)
         self.new_subtask_button.clicked.connect(self._create_subtask)
         self.edit_button.clicked.connect(self._edit_selected_item)
         self.delete_button.clicked.connect(self._delete_selected_item)
-        self.status_filter.currentIndexChanged.connect(self.refresh_tasks)
-        self.priority_filter.currentIndexChanged.connect(self.refresh_tasks)
-        self.search_input.textChanged.connect(self.refresh_tasks)
-        self.sort_filter.currentIndexChanged.connect(self.refresh_tasks)
+        self.undo_button.clicked.connect(self._undo_last_delete)
+        self.status_filter.currentIndexChanged.connect(self._on_filters_changed)
+        self.priority_filter.currentIndexChanged.connect(self._on_filters_changed)
+        self.search_input.textChanged.connect(self._on_search_text_changed)
+        self.sort_filter.currentIndexChanged.connect(self._on_filters_changed)
         self.table.itemChanged.connect(self._on_item_changed)
         self.table.row_reordered.connect(self._on_rows_moved)
         self.table.set_drop_target_resolver(self._resolve_drop_target_row)
@@ -205,30 +354,84 @@ class MainWindow(QMainWindow):
         self.delete_shortcut.activated.connect(self._delete_selected_item)
         self.new_subtask_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
         self.new_subtask_shortcut.activated.connect(self._create_subtask)
+        self.undo_shortcut = QShortcut(QKeySequence.Undo, self)
+        self.undo_shortcut.activated.connect(self._undo_last_delete)
 
         self.refresh_tasks()
 
-    def refresh_tasks(self) -> None:
+    def _on_filters_changed(self, *_: object) -> None:
+        self.refresh_tasks()
+
+    def _on_search_text_changed(self, _text: str) -> None:
+        # Espera que o utilizador pare de escrever antes de voltar a consultar a BD.
+        self.search_timer.start()
+
+    def refresh_tasks(self, select: set[EntityKey] | None = None) -> None:
+        """Redesenha a tabela.
+
+        Por omissao mantem a selecao, a linha atual e o scroll. Se `select` for dado,
+        seleciona essas entidades e faz scroll ate elas.
+        """
+        self.search_timer.stop()
+        if select is None:
+            keys_to_select = self._selected_keys()
+            current_key = self._current_key()
+        else:
+            keys_to_select = select
+            current_key = next(iter(select), None)
+        scroll_value = self.table.verticalScrollBar().value()
+
         status = self.status_filter.currentData()
         priority = self.priority_filter.currentData()
         query = self.search_input.text()
         sort = self.sort_filter.currentData()
 
         tasks = self.service.list_tasks(status=status, priority=priority, query=query, sort=sort)
+        subtasks_by_task = self.service.list_subtasks_for_tasks([task.id for task in tasks])
+        today = datetime.now().astimezone().date()
 
         self._loading_table = True
         self.table.blockSignals(True)
         self.table.setRowCount(0)
-        for task in tasks:
-            self._append_task_row(task)
-            subtasks = self.service.list_subtasks(task.id)
-            self._append_nested_subtasks(task.id, subtasks)
+        for group_index, task in enumerate(tasks):
+            style = self._group_style(group_index, task)
+            self._append_task_row(task, today, style)
+            self._append_nested_subtasks(task.id, subtasks_by_task.get(task.id, []), style)
         self.table.blockSignals(False)
         self._loading_table = False
 
-        self.statusBar().showMessage(f"{len(tasks)} tarefa(s)")
+        self._restore_selection(keys_to_select, current_key)
+        if select is None:
+            self.table.verticalScrollBar().setValue(scroll_value)
+        else:
+            self._scroll_to_key(current_key)
 
-    def _append_task_row(self, task: Task) -> None:
+        self.task_count_label.setText(f"{len(tasks)} tarefa(s)")
+
+    def _group_style(self, group_index: int, task: Task) -> GroupStyle:
+        palette = self.table.palette()
+        base = palette.color(QPalette.Base)
+        text = palette.color(QPalette.Text)
+        background = base if group_index % 2 == 0 else _mix(base, text, GROUP_ALT_TINT)
+        accent = (
+            palette.color(QPalette.Mid)
+            if task.status is Status.DONE
+            else PRIORITY_COLORS[task.priority]
+        )
+        return GroupStyle(
+            background=background,
+            header_background=_mix(background, text, TASK_HEADER_TINT),
+            accent=accent,
+        )
+
+    def _apply_group_style(self, row: int, background: QColor, accent: QColor) -> None:
+        for column in range(self.table.columnCount()):
+            item = self.table.item(row, column)
+            if item is not None:
+                item.setBackground(background)
+        self.table.item(row, 0).setData(ROLE_GROUP_ACCENT, accent)
+
+    def _append_task_row(self, task: Task, today: date, style: GroupStyle) -> None:
         row = self.table.rowCount()
         self.table.insertRow(row)
 
@@ -243,12 +446,21 @@ class MainWindow(QMainWindow):
         self.table.setItem(row, 0, checkbox_item)
 
         title_item = QTableWidgetItem(task.title)
-        self._set_item_identity(title_item, "task", task.id, task.id, parent_subtask_id=None, depth=0)
+        title_font = QFont(title_item.font())
+        title_font.setBold(True)
+        title_item.setFont(title_font)
+        if task.description:
+            title_item.setToolTip(task.description)
+        self._set_item_identity(
+            title_item, "task", task.id, task.id, parent_subtask_id=None, depth=0
+        )
         self.table.setItem(row, 1, title_item)
 
-        self.table.setItem(row, 2, QTableWidgetItem(priority_label_pt(task.priority)))
-        due_date_text = task.due_date.isoformat() if task.due_date else "Sem data"
-        self.table.setItem(row, 3, QTableWidgetItem(due_date_text))
+        priority_item = QTableWidgetItem(priority_label_pt(task.priority))
+        priority_item.setForeground(PRIORITY_COLORS[task.priority])
+        self.table.setItem(row, 2, priority_item)
+
+        self.table.setItem(row, 3, self._build_due_date_item(task, today))
 
         progress_text = (
             "Sem subtarefas"
@@ -258,17 +470,42 @@ class MainWindow(QMainWindow):
         self.table.setItem(row, 4, QTableWidgetItem(progress_text))
         self.table.setItem(row, 5, QTableWidgetItem(_format_datetime(task.updated_at)))
         self._set_row_drag_enabled(row, enabled=False)
+        self._apply_group_style(row, style.header_background, style.accent)
 
         if task.status is Status.DONE:
             self._strike_row_text(row)
 
-    def _append_nested_subtasks(self, task_id: int, subtasks: list[Subtask]) -> None:
+    def _build_due_date_item(self, task: Task, today: date) -> QTableWidgetItem:
+        if task.due_date is None:
+            return QTableWidgetItem("Sem data")
+
+        item = QTableWidgetItem(task.due_date.isoformat())
+        if task.status is not Status.DONE and task.due_date < today:
+            item.setText(f"{task.due_date.isoformat()} (atrasada)")
+            item.setForeground(OVERDUE_COLOR)
+            font = QFont(item.font())
+            font.setBold(True)
+            item.setFont(font)
+        return item
+
+    def _append_nested_subtasks(
+        self, task_id: int, subtasks: list[Subtask], style: GroupStyle
+    ) -> None:
         children_by_parent: dict[int | None, list[Subtask]] = {}
         for subtask in subtasks:
             children_by_parent.setdefault(subtask.parent_subtask_id, []).append(subtask)
 
-        for root_subtask in children_by_parent.get(None, []):
-            self._append_subtask_recursive(task_id, root_subtask, children_by_parent, depth=1)
+        roots = children_by_parent.get(None, [])
+        for idx, root_subtask in enumerate(roots):
+            self._append_subtask_recursive(
+                task_id,
+                root_subtask,
+                children_by_parent,
+                depth=1,
+                prefix="",
+                is_last=idx == len(roots) - 1,
+                style=style,
+            )
 
     def _append_subtask_recursive(
         self,
@@ -276,6 +513,9 @@ class MainWindow(QMainWindow):
         subtask: Subtask,
         children_by_parent: dict[int | None, list[Subtask]],
         depth: int,
+        prefix: str,
+        is_last: bool,
+        style: GroupStyle,
     ) -> None:
         row = self.table.rowCount()
         self.table.insertRow(row)
@@ -290,9 +530,8 @@ class MainWindow(QMainWindow):
         )
         self.table.setItem(row, 0, checkbox_item)
 
-        indent = "    " * depth
-        title_text = f"{indent}- {subtask.title}"
-        title_item = QTableWidgetItem(title_text)
+        connector = TREE_LAST if is_last else TREE_BRANCH
+        title_item = QTableWidgetItem(f"{prefix}{connector}{subtask.title}")
         if subtask.description:
             title_item.setToolTip(subtask.description)
         self._set_item_identity(
@@ -312,12 +551,23 @@ class MainWindow(QMainWindow):
         self.table.setItem(row, 4, QTableWidgetItem(child_text))
         self.table.setItem(row, 5, QTableWidgetItem(_format_datetime(subtask.updated_at)))
         self._set_row_drag_enabled(row, enabled=True)
+        self._apply_group_style(row, style.background, style.accent)
 
         if subtask.status is Status.DONE:
             self._strike_row_text(row)
 
-        for child in children_by_parent.get(subtask.id, []):
-            self._append_subtask_recursive(task_id, child, children_by_parent, depth=depth + 1)
+        children = children_by_parent.get(subtask.id, [])
+        child_prefix = prefix + (TREE_SPACE if is_last else TREE_PIPE)
+        for idx, child in enumerate(children):
+            self._append_subtask_recursive(
+                task_id,
+                child,
+                children_by_parent,
+                depth=depth + 1,
+                prefix=child_prefix,
+                is_last=idx == len(children) - 1,
+                style=style,
+            )
 
     def _build_check_item(
         self,
@@ -376,6 +626,58 @@ class MainWindow(QMainWindow):
             font = QFont(item.font())
             font.setStrikeOut(True)
             item.setFont(font)
+
+    def _row_key(self, row: int) -> EntityKey | None:
+        title_item = self.table.item(row, 1)
+        if title_item is None:
+            return None
+        entity_type = title_item.data(ROLE_ENTITY_TYPE)
+        entity_id = title_item.data(ROLE_ENTITY_ID)
+        if entity_type not in {"task", "subtask"} or entity_id is None:
+            return None
+        return str(entity_type), int(entity_id)
+
+    def _row_for_key(self, key: EntityKey | None) -> int:
+        if key is None:
+            return -1
+        for row in range(self.table.rowCount()):
+            if self._row_key(row) == key:
+                return row
+        return -1
+
+    def _selected_keys(self) -> set[EntityKey]:
+        keys: set[EntityKey] = set()
+        for index in self.table.selectionModel().selectedRows():
+            key = self._row_key(index.row())
+            if key is not None:
+                keys.add(key)
+        return keys
+
+    def _current_key(self) -> EntityKey | None:
+        row = self.table.currentRow()
+        return self._row_key(row) if row >= 0 else None
+
+    def _restore_selection(self, keys: set[EntityKey], current_key: EntityKey | None) -> None:
+        selection_model = self.table.selectionModel()
+        selection_model.clearSelection()
+
+        current_row = self._row_for_key(current_key)
+        if current_row >= 0:
+            selection_model.setCurrentIndex(
+                self.table.model().index(current_row, 1), QItemSelectionModel.NoUpdate
+            )
+
+        for row in range(self.table.rowCount()):
+            if self._row_key(row) in keys:
+                selection_model.select(
+                    self.table.model().index(row, 0),
+                    QItemSelectionModel.Select | QItemSelectionModel.Rows,
+                )
+
+    def _scroll_to_key(self, key: EntityKey | None) -> None:
+        row = self._row_for_key(key)
+        if row >= 0:
+            self.table.scrollToItem(self.table.item(row, 1))
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
         if self._loading_table or item.column() != 0:
@@ -533,9 +835,10 @@ class MainWindow(QMainWindow):
         if not grouped_order:
             return False
 
+        task_ids = sorted({task_id for task_id, _ in grouped_order})
         existing_order_by_group: dict[tuple[int, int | None], list[int]] = {}
-        for task_id in sorted({task_id for task_id, _ in grouped_order}):
-            for subtask in self.service.list_subtasks(task_id):
+        for task_id, subtasks in self.service.list_subtasks_for_tasks(task_ids).items():
+            for subtask in subtasks:
                 key = (task_id, subtask.parent_subtask_id)
                 existing_order_by_group.setdefault(key, []).append(subtask.id)
 
@@ -560,13 +863,13 @@ class MainWindow(QMainWindow):
 
         title, description, priority, due_date = dialog.get_values()
         try:
-            self.service.create_task(
+            created = self.service.create_task(
                 title=title,
                 description=description,
                 priority=priority,
                 due_date=due_date,
             )
-            self.refresh_tasks()
+            self.refresh_tasks(select={("task", created.id)})
         except ValidationError as exc:
             QMessageBox.warning(self, "Validacao", str(exc))
 
@@ -595,20 +898,22 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            self.service.create_subtask(
+            created = self.service.create_subtask(
                 task_id=task_id,
                 title=title,
                 description=description,
                 parent_subtask_id=parent_subtask_id,
             )
-            self.refresh_tasks()
+            self.refresh_tasks(select={("subtask", created.id)})
         except (ValidationError, ValueError) as exc:
             QMessageBox.warning(self, "Erro", str(exc))
 
     def _edit_selected_item(self) -> None:
         selected = self._selected_entity()
         if selected is None:
-            QMessageBox.information(self, "Editar", "Seleciona uma tarefa ou subtarefa para editar.")
+            QMessageBox.information(
+                self, "Editar", "Seleciona uma tarefa ou subtarefa para editar."
+            )
             return
 
         if selected["entity_type"] == "task":
@@ -697,22 +1002,49 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.Yes:
             return
 
-        entities_to_delete = self._normalize_delete_selection(selected_entities)
-        errors: list[str] = []
-        for item in entities_to_delete:
-            try:
-                if item["entity_type"] == "task":
-                    self.service.delete_task(item["entity_id"])
-                else:
-                    self.service.delete_subtask(item["entity_id"])
-            except ValueError as exc:
-                # Ignore "already deleted" from cascade effects.
-                if "nao existe" not in str(exc):
-                    errors.append(str(exc))
-
+        task_ids = [int(e["entity_id"]) for e in selected_entities if e["entity_type"] == "task"]
+        subtask_ids = [
+            int(e["entity_id"]) for e in selected_entities if e["entity_type"] == "subtask"
+        ]
+        snapshot = self.service.delete_items(task_ids, subtask_ids)
         self.refresh_tasks()
-        if errors:
-            QMessageBox.warning(self, "Erro", errors[0])
+        if snapshot.is_empty:
+            return
+
+        self._undo_stack.append(snapshot)
+        del self._undo_stack[:-UNDO_STACK_LIMIT]
+        self.undo_button.setEnabled(True)
+        deleted_count = len(snapshot.tasks) + len(snapshot.subtasks)
+        self.statusBar().showMessage(
+            f"{deleted_count} item(ns) apagado(s). Ctrl+Z para desfazer.", STATUS_MESSAGE_MS
+        )
+
+    def _undo_last_delete(self) -> None:
+        if not self._undo_stack:
+            return
+
+        snapshot = self._undo_stack.pop()
+        self.undo_button.setEnabled(bool(self._undo_stack))
+        try:
+            self.service.restore_deleted(snapshot)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Desfazer", str(exc))
+            self.refresh_tasks()
+            return
+
+        # Seleciona so as raizes do que foi restaurado (os descendentes vem por arrasto).
+        restored_keys: set[EntityKey] = {("task", task.id) for task in snapshot.tasks}
+        restored_task_ids = {task.id for task in snapshot.tasks}
+        restored_subtask_ids = {sub.id for sub in snapshot.subtasks}
+        restored_keys |= {
+            ("subtask", sub.id)
+            for sub in snapshot.subtasks
+            if sub.task_id not in restored_task_ids
+            and sub.parent_subtask_id not in restored_subtask_ids
+        }
+        self.refresh_tasks(select=restored_keys)
+        restored_count = len(snapshot.tasks) + len(snapshot.subtasks)
+        self.statusBar().showMessage(f"{restored_count} item(ns) restaurado(s).", STATUS_MESSAGE_MS)
 
     def _selected_entity(self) -> dict[str, int | str] | None:
         row = self.table.currentRow()
@@ -766,27 +1098,6 @@ class MainWindow(QMainWindow):
             )
 
         return entities
-
-    def _normalize_delete_selection(
-        self, entities: list[dict[str, int | str]]
-    ) -> list[dict[str, int | str]]:
-        selected_task_ids = {
-            int(entity["entity_id"])
-            for entity in entities
-            if entity["entity_type"] == "task"
-        }
-
-        filtered = [
-            entity
-            for entity in entities
-            if not (
-                entity["entity_type"] == "subtask"
-                and int(entity["task_id"]) in selected_task_ids
-            )
-        ]
-
-        filtered.sort(key=lambda entity: 0 if entity["entity_type"] == "task" else 1)
-        return filtered
 
 
 def _format_datetime(value: datetime) -> str:

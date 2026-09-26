@@ -34,7 +34,9 @@ pip install -e .[dev]
 - Pesquisar por texto no titulo/descricao
 - Ordenar por mais recentes, data limite e prioridade
 - Apagar em lote por selecao multipla
-- Atalhos: `Delete` (apagar selecao) e `Ctrl+S` (nova subtarefa da selecao)
+- Desfazer apagamentos (botao `Desfazer` ou `Ctrl+Z`)
+- Cores por prioridade e destaque de tarefas atrasadas
+- Atalhos: `Delete` (apagar selecao), `Ctrl+S` (nova subtarefa da selecao) e `Ctrl+Z` (desfazer)
 
 ## Estrutura
 
