@@ -1,10 +1,6 @@
-# To-Do List (Desktop + Web)
+# To-Do List (Desktop)
 
-Aplicacao local para gerir tarefas com persistencia SQLite.
-
-Inclui duas interfaces:
-- Desktop: PySide6
-- Web: FastAPI + templates server-side
+Aplicacao desktop local para gerir tarefas com persistencia SQLite, feita com PySide6.
 
 ## Requisitos
 
@@ -20,9 +16,7 @@ pip install -e .[dev]
 
 ## Comandos
 
-- Run Desktop: `python -m todo_app`
-- Run Web: `python -m uvicorn todo_app.web.app:app --host 127.0.0.1 --port 8000 --reload`
-- Run Web (script, opcional): `todo-web`
+- Run: `python -m todo_app`
 - Test: `pytest`
 - Lint: `ruff check .`
 - Format: `black .`
@@ -35,16 +29,16 @@ pip install -e .[dev]
 - Criar e gerir subtarefas com multiplos niveis (subtarefas de subtarefas)
 - Definir titulo e descricao para cada subtarefa
 - Mostrar subtarefas na lista principal com indentacao hierarquica
+- Reordenar subtarefas por drag & drop
 - Filtrar por estado e prioridade
 - Pesquisar por texto no titulo/descricao
 - Ordenar por mais recentes, data limite e prioridade
 - Apagar em lote por selecao multipla
-- Atalhos na versao web: `Delete` (apagar selecao) e `Ctrl+S` (nova subtarefa da selecao)
+- Atalhos: `Delete` (apagar selecao) e `Ctrl+S` (nova subtarefa da selecao)
 
 ## Estrutura
 
 - `src/todo_app/ui`: Interface grafica
-- `src/todo_app/web`: Interface web, templates e static files
 - `src/todo_app/service.py`: Regras de negocio e validacao
 - `src/todo_app/repository.py`: Acesso SQLite e queries
 - `src/todo_app/models.py`: Tipos e entidades

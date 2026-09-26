@@ -10,10 +10,6 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "PySide6>=6.7,<7",
-    "fastapi>=0.115,<1",
-    "jinja2>=3.1,<4",
-    "python-multipart>=0.0.9,<1",
-    "uvicorn>=0.30,<1",
 ]
 
 [project.optional-dependencies]
@@ -22,25 +18,16 @@ dev = [
     "ruff>=0.6,<1",
     "black>=24.4,<25",
     "pyinstaller>=6.10,<7",
-    "httpx>=0.27,<1",
 ]
 
 [project.scripts]
 todo-app = "todo_app.app:main"
-todo-web = "todo_app.web.app:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-todo_app = [
-    "web/templates/*.html",
-    "web/static/css/*.css",
-    "web/static/js/*.js",
-]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
